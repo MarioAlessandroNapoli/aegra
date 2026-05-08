@@ -16,6 +16,10 @@ class BasicSession(DummySessionBase):
         """Mock commit method"""
         pass
 
+    async def rollback(self) -> None:
+        """Mock rollback method"""
+        pass
+
     async def refresh(self, obj: Any) -> None:
         """Mock refresh method"""
         pass

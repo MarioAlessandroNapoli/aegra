@@ -1,11 +1,12 @@
 """Tests for ThreadCreate.supersteps validation.
 
 Supersteps mirror the LangGraph SDK ``ThreadsClient.create(supersteps=...)``
-contract used for cross-deployment thread migration. Each superstep contains
-a sequence of updates ``{values, command, as_node, task_id?}`` that the server
-applies via ``Pregel.abulk_update_state``. We validate payload shape here so
-clients see structural errors as 422 at request time rather than 500 from
-``abulk_update_state`` downstream.
+contract used for cross-deployment thread migration. Each update carries
+``values``/``as_node``/optional ``task_id`` that the server applies via
+``Pregel.abulk_update_state``. ``command``-based updates are rejected at
+the model boundary because ``StateUpdate`` has no slot for them — accepting
+silently would lose data. Outer-list/outer-dict types are enforced by
+Pydantic's coercion before our validator runs.
 """
 
 import pytest
@@ -21,22 +22,32 @@ class TestThreadCreateSupersteps:
         thread = ThreadCreate(metadata={"graph_id": "agent"})
         assert thread.supersteps is None
 
+    def test_accepts_empty_list(self):
+        """Empty supersteps is a no-op: helper short-circuits, no error."""
+        thread = ThreadCreate(supersteps=[])
+        assert thread.supersteps == []
+
     def test_accepts_single_superstep_with_values(self):
         payload = [{"updates": [{"values": {"messages": [{"role": "user", "content": "hi"}]}, "as_node": "model"}]}]
         thread = ThreadCreate(supersteps=payload)
         assert thread.supersteps == payload
 
-    def test_accepts_command_field_in_update(self):
-        """SDK contract includes ``command`` field; we accept it in the payload
-        for drop-in compat even though ``StateUpdate`` has no command slot."""
-        payload = [{"updates": [{"values": None, "command": {"resume": "yes"}, "as_node": "interrupt"}]}]
+    def test_accepts_values_none_for_checkpoint_anchor(self):
+        """``values=None`` is legal for `__copy__` fork anchoring (LangGraph Studio re-run)."""
+        payload = [{"updates": [{"values": None, "as_node": "__copy__"}]}]
         thread = ThreadCreate(supersteps=payload)
-        assert thread.supersteps[0]["updates"][0]["command"] == {"resume": "yes"}
+        assert thread.supersteps[0]["updates"][0]["values"] is None
 
     def test_accepts_optional_task_id(self):
         payload = [{"updates": [{"values": {"k": 1}, "as_node": "model", "task_id": "task-x"}]}]
         thread = ThreadCreate(supersteps=payload)
         assert thread.supersteps[0]["updates"][0]["task_id"] == "task-x"
+
+    def test_rejects_command_field_present(self):
+        """``command`` updates rejected: StateUpdate has no slot for command."""
+        payload = [{"updates": [{"values": None, "command": {"resume": "yes"}, "as_node": "interrupt"}]}]
+        with pytest.raises(ValidationError, match="command-based updates are not supported"):
+            ThreadCreate(supersteps=payload)
 
     def test_rejects_superstep_not_object(self):
         # Pydantic's built-in type check rejects non-dict before our validator runs.

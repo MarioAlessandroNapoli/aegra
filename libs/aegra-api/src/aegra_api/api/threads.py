@@ -35,6 +35,10 @@ from aegra_api.models import (
     User,
 )
 from aegra_api.models.errors import CONFLICT, NOT_FOUND
+from aegra_api.services.langgraph_service import (
+    create_thread_config,
+    get_langgraph_service,
+)
 from aegra_api.services.streaming_service import streaming_service
 from aegra_api.services.thread_copy import copy_thread_atomically
 from aegra_api.services.thread_state_service import ThreadStateService
@@ -211,10 +215,24 @@ async def create_thread(
     )
 
     session.add(thread_orm)
-    await session.commit()
 
+    # When supersteps are requested, defer the thread-row commit until the
+    # checkpoint writes succeed: a failure here rolls back the SQLAlchemy
+    # session so no orphan thread row becomes visible. Note that
+    # `abulk_update_state` owns its own connection on the langgraph-checkpoint
+    # pool and commits autonomously — a strict cross-pool atomic copy would
+    # require mirroring the /copy endpoint (single lg_pool tx around both
+    # INSERTs), tracked as a follow-up; user-visible state is consistent here
+    # because the failed-supersteps thread is never queryable.
     if request.supersteps:
-        await _apply_supersteps(thread_id, metadata, request.supersteps, user)
+        try:
+            await _apply_supersteps(thread_id, metadata, request.supersteps, user)
+        except Exception:
+            await session.rollback()
+            raise
+        await session.commit()
+    else:
+        await session.commit()
 
     with contextlib.suppress(Exception):
         await session.refresh(thread_orm)
@@ -232,10 +250,9 @@ async def _apply_supersteps(
     """Apply LangGraph SDK supersteps payload via langgraph-checkpoint-postgres.
 
     Used for cross-deployment thread migration (drop-in replacement of LangSmith
-    Deployments). Each superstep contains a sequence of updates; each update has
-    `values` and `as_node`. The SDK contract also includes a `command` field, but
-    `langgraph.types.StateUpdate` has no slot for it, so it is accepted in the
-    payload (for SDK compat) and not propagated to `abulk_update_state`.
+    Deployments). Each update may carry `values` (dict; may be None for
+    checkpoint-anchoring `__copy__` fork operations) and `as_node`; `command`-
+    based updates are rejected upstream by the model validator.
     """
     graph_id = metadata.get("graph_id")
     if not graph_id:
@@ -246,28 +263,19 @@ async def _apply_supersteps(
 
     bulk: list[list[StateUpdate]] = []
     for sup in supersteps:
-        updates: list[StateUpdate] = []
-        for upd in sup.get("updates", []):
-            values = upd.get("values")
-            if values is None and upd.get("command") is None:
-                continue
-            updates.append(
-                StateUpdate(
-                    values=values,
-                    as_node=upd.get("as_node"),
-                    task_id=upd.get("task_id"),
-                )
+        updates: list[StateUpdate] = [
+            StateUpdate(
+                values=upd.get("values"),
+                as_node=upd.get("as_node"),
+                task_id=upd.get("task_id"),
             )
+            for upd in sup.get("updates", [])
+        ]
         if updates:
             bulk.append(updates)
 
     if not bulk:
         return
-
-    from aegra_api.services.langgraph_service import (
-        create_thread_config,
-        get_langgraph_service,
-    )
 
     config = create_thread_config(thread_id, user)
     langgraph_service = get_langgraph_service()
@@ -278,7 +286,6 @@ async def _apply_supersteps(
             access_context="threads.create",
             user=user,
         ) as agent:
-            agent = agent.with_config(config)
             await agent.abulk_update_state(config, bulk)
     except HTTPException:
         raise

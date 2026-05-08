@@ -37,14 +37,19 @@ class ThreadCreate(BaseModel):
     @field_validator("supersteps")
     @classmethod
     def _validate_supersteps_shape(cls, v: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
-        """Validate supersteps payload shape matches SDK contract."""
+        """Validate supersteps payload shape matches SDK contract.
+
+        Outer-list and outer-dict types are enforced by Pydantic's coercion
+        before this validator runs; we cover the inner `updates` shape only.
+        `command`-based updates are rejected because `StateUpdate` (the type
+        consumed by `Pregel.abulk_update_state`) has no slot for it — accepting
+        them silently would lose data.
+        """
         if v is None:
             return v
         if len(v) > 1000:
             raise ValueError("supersteps: max 1000 supersteps per request")
         for i, sup in enumerate(v):
-            if not isinstance(sup, dict):
-                raise ValueError(f"supersteps[{i}]: expected object, got {type(sup).__name__}")
             updates = sup.get("updates")
             if not isinstance(updates, list):
                 raise ValueError(f"supersteps[{i}].updates: expected array")
@@ -55,6 +60,11 @@ class ThreadCreate(BaseModel):
                     raise ValueError(f"supersteps[{i}].updates[{j}]: expected object, got {type(upd).__name__}")
                 if "as_node" not in upd:
                     raise ValueError(f"supersteps[{i}].updates[{j}]: 'as_node' required")
+                if upd.get("command") is not None:
+                    raise ValueError(
+                        f"supersteps[{i}].updates[{j}].command: command-based updates are not supported "
+                        "(StateUpdate has no command slot in the current LangGraph runtime)"
+                    )
         return v
 
 

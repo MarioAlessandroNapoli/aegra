@@ -1211,6 +1211,16 @@ class TestCreateThreadWithSupersteps:
         assert resp.status_code == 200
         spy.assert_not_called()
 
+    def test_empty_supersteps_does_not_invoke_apply(self, client):
+        """Empty list short-circuits in ``create_thread`` (truthiness check)."""
+        with patch("aegra_api.api.threads._apply_supersteps", new=AsyncMock()) as spy:
+            resp = client.post(
+                "/threads",
+                json={"metadata": {"graph_id": "agent"}, "supersteps": []},
+            )
+        assert resp.status_code == 200
+        spy.assert_not_called()
+
     def test_supersteps_invokes_apply_with_payload(self, client):
         """Supersteps payload is forwarded to ``_apply_supersteps`` after thread INSERT."""
         payload = [{"updates": [{"values": {"k": 1}, "as_node": "model"}]}]
@@ -1221,18 +1231,16 @@ class TestCreateThreadWithSupersteps:
             )
         assert resp.status_code == 200
         spy.assert_called_once()
-        args, _ = spy.call_args
-        # signature: (thread_id, metadata, supersteps, user)
-        assert args[2] == payload
-        assert args[1].get("graph_id") == "agent"
+        # Match signature (thread_id, metadata, supersteps, user) by introspection
+        # rather than positional index — robust to future arg reordering.
+        bound = spy.call_args
+        passed_supersteps = bound.args[2] if len(bound.args) > 2 else bound.kwargs["supersteps"]
+        passed_metadata = bound.args[1] if len(bound.args) > 1 else bound.kwargs["metadata"]
+        assert passed_supersteps == payload
+        assert passed_metadata.get("graph_id") == "agent"
 
     def test_supersteps_requires_graph_id(self, client):
-        """``_apply_supersteps`` raises 400 when metadata.graph_id is missing.
-
-        Tests against the real implementation (no patch) — the helper is the
-        single enforcement point and must fail loud rather than silently apply
-        updates against a default graph.
-        """
+        """``_apply_supersteps`` raises 400 when metadata.graph_id is missing."""
         payload = [{"updates": [{"values": {}, "as_node": "model"}]}]
         resp = client.post("/threads", json={"metadata": {}, "supersteps": payload})
         assert resp.status_code == 400
@@ -1243,7 +1251,6 @@ class TestCreateThreadWithSupersteps:
         ``abulk_update_state`` receives the right ``StateUpdate`` shape."""
         captured_bulk: list = []
         agent = MagicMock()
-        agent.with_config = MagicMock(return_value=agent)
 
         async def fake_abulk(_config, supersteps):
             captured_bulk.extend(supersteps)
@@ -1262,7 +1269,7 @@ class TestCreateThreadWithSupersteps:
             }
         ]
         with patch(
-            "aegra_api.services.langgraph_service.get_langgraph_service",
+            "aegra_api.api.threads.get_langgraph_service",
             return_value=svc,
         ):
             resp = client.post(
@@ -1279,32 +1286,12 @@ class TestCreateThreadWithSupersteps:
         assert bulk_first[1].as_node == "tools"
         assert bulk_first[1].task_id == "t1"
 
-    def test_supersteps_command_field_accepted_but_not_propagated(self, client):
-        """SDK contract includes ``command``; we accept it in payload but
-        ``StateUpdate`` has no ``command`` slot, so it is dropped on the way
-        to ``abulk_update_state``. This documents the gap honestly."""
-        captured_bulk: list = []
-        agent = MagicMock()
-        agent.with_config = MagicMock(return_value=agent)
-
-        async def fake_abulk(_config, supersteps):
-            captured_bulk.extend(supersteps)
-
-        agent.abulk_update_state = AsyncMock(side_effect=fake_abulk)
-
-        svc = MagicMock()
-        svc.get_graph = create_get_graph_mock(return_value=agent)
-
+    def test_command_rejected_at_validator_with_422(self, client):
+        """``command`` updates rejected at the model boundary — no silent drop."""
         payload = [{"updates": [{"command": {"resume": True}, "as_node": "interrupt"}]}]
-        with patch(
-            "aegra_api.services.langgraph_service.get_langgraph_service",
-            return_value=svc,
-        ):
-            resp = client.post(
-                "/threads",
-                json={"metadata": {"graph_id": "agent"}, "supersteps": payload},
-            )
-        assert resp.status_code == 200
-        # Update reaches abulk_update_state but with values=None (command silently dropped).
-        assert captured_bulk[0][0].values is None
-        assert captured_bulk[0][0].as_node == "interrupt"
+        resp = client.post(
+            "/threads",
+            json={"metadata": {"graph_id": "agent"}, "supersteps": payload},
+        )
+        assert resp.status_code == 422
+        assert "command-based updates are not supported" in resp.text
