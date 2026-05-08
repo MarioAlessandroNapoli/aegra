@@ -25,6 +25,37 @@ class ThreadCreate(BaseModel):
         alias="ifExists",
         description="Behavior when thread exists: 'raise' (default) or 'do_nothing'",
     )
+    supersteps: list[dict[str, Any]] | None = Field(
+        None,
+        description=(
+            "Apply a list of supersteps when creating a thread, each containing a "
+            "sequence of updates. Each update has `values` or `command` and `as_node`. "
+            "Used for copying a thread between deployments (LangGraph SDK contract)."
+        ),
+    )
+
+    @field_validator("supersteps")
+    @classmethod
+    def _validate_supersteps_shape(cls, v: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+        """Validate supersteps payload shape matches SDK contract."""
+        if v is None:
+            return v
+        if len(v) > 1000:
+            raise ValueError("supersteps: max 1000 supersteps per request")
+        for i, sup in enumerate(v):
+            if not isinstance(sup, dict):
+                raise ValueError(f"supersteps[{i}]: expected object, got {type(sup).__name__}")
+            updates = sup.get("updates")
+            if not isinstance(updates, list):
+                raise ValueError(f"supersteps[{i}].updates: expected array")
+            if len(updates) > 1000:
+                raise ValueError(f"supersteps[{i}].updates: max 1000 updates per superstep")
+            for j, upd in enumerate(updates):
+                if not isinstance(upd, dict):
+                    raise ValueError(f"supersteps[{i}].updates[{j}]: expected object, got {type(upd).__name__}")
+                if "as_node" not in upd:
+                    raise ValueError(f"supersteps[{i}].updates[{j}]: 'as_node' required")
+        return v
 
 
 class ThreadUpdate(BaseModel):

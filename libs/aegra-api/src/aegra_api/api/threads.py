@@ -10,6 +10,7 @@ from uuid import uuid4
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query
+from langgraph.types import StateUpdate
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -212,11 +213,78 @@ async def create_thread(
     session.add(thread_orm)
     await session.commit()
 
+    if request.supersteps:
+        await _apply_supersteps(thread_id, metadata, request.supersteps, user)
+
     with contextlib.suppress(Exception):
         await session.refresh(thread_orm)
 
     # Pass metadata explicitly in case refresh failed (tests/mocks)
     return _serialize_thread(thread_orm, default_metadata=metadata)
+
+
+async def _apply_supersteps(
+    thread_id: str,
+    metadata: dict[str, Any],
+    supersteps: list[dict[str, Any]],
+    user: User,
+) -> None:
+    """Apply LangGraph SDK supersteps payload via langgraph-checkpoint-postgres.
+
+    Used for cross-deployment thread migration (drop-in replacement of LangSmith
+    Deployments). Each superstep contains a sequence of updates; each update has
+    `values` and `as_node`. The SDK contract also includes a `command` field, but
+    `langgraph.types.StateUpdate` has no slot for it, so it is accepted in the
+    payload (for SDK compat) and not propagated to `abulk_update_state`.
+    """
+    graph_id = metadata.get("graph_id")
+    if not graph_id:
+        raise HTTPException(
+            400,
+            "supersteps requires metadata.graph_id to identify the target graph",
+        )
+
+    bulk: list[list[StateUpdate]] = []
+    for sup in supersteps:
+        updates: list[StateUpdate] = []
+        for upd in sup.get("updates", []):
+            values = upd.get("values")
+            if values is None and upd.get("command") is None:
+                continue
+            updates.append(
+                StateUpdate(
+                    values=values,
+                    as_node=upd.get("as_node"),
+                    task_id=upd.get("task_id"),
+                )
+            )
+        if updates:
+            bulk.append(updates)
+
+    if not bulk:
+        return
+
+    from aegra_api.services.langgraph_service import (
+        create_thread_config,
+        get_langgraph_service,
+    )
+
+    config = create_thread_config(thread_id, user)
+    langgraph_service = get_langgraph_service()
+    try:
+        async with langgraph_service.get_graph(
+            graph_id,
+            config=config,
+            access_context="threads.create",
+            user=user,
+        ) as agent:
+            agent = agent.with_config(config)
+            await agent.abulk_update_state(config, bulk)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to apply supersteps for thread '%s'", thread_id)
+        raise HTTPException(500, f"Failed to apply supersteps: {e}") from e
 
 
 @router.get("/threads", response_model=ThreadList)

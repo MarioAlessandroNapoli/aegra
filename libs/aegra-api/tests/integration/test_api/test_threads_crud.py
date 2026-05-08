@@ -1193,3 +1193,118 @@ class TestUpdateThread:
         data = resp.json()
         # Data should not have changed
         assert data["metadata"]["initial"] is True
+
+
+class TestCreateThreadWithSupersteps:
+    """POST /threads with supersteps payload (LangGraph SDK cross-deployment migration)."""
+
+    @pytest.fixture
+    def client(self) -> TestClient:
+        app = create_test_app(include_runs=False, include_threads=True)
+        override_session_dependency(app, BasicSession)
+        return make_client(app)
+
+    def test_no_supersteps_does_not_invoke_apply(self, client):
+        """Default path: no supersteps → ``_apply_supersteps`` must not be called."""
+        with patch("aegra_api.api.threads._apply_supersteps", new=AsyncMock()) as spy:
+            resp = client.post("/threads", json={"metadata": {"graph_id": "agent"}})
+        assert resp.status_code == 200
+        spy.assert_not_called()
+
+    def test_supersteps_invokes_apply_with_payload(self, client):
+        """Supersteps payload is forwarded to ``_apply_supersteps`` after thread INSERT."""
+        payload = [{"updates": [{"values": {"k": 1}, "as_node": "model"}]}]
+        with patch("aegra_api.api.threads._apply_supersteps", new=AsyncMock()) as spy:
+            resp = client.post(
+                "/threads",
+                json={"metadata": {"graph_id": "agent"}, "supersteps": payload},
+            )
+        assert resp.status_code == 200
+        spy.assert_called_once()
+        args, _ = spy.call_args
+        # signature: (thread_id, metadata, supersteps, user)
+        assert args[2] == payload
+        assert args[1].get("graph_id") == "agent"
+
+    def test_supersteps_requires_graph_id(self, client):
+        """``_apply_supersteps`` raises 400 when metadata.graph_id is missing.
+
+        Tests against the real implementation (no patch) — the helper is the
+        single enforcement point and must fail loud rather than silently apply
+        updates against a default graph.
+        """
+        payload = [{"updates": [{"values": {}, "as_node": "model"}]}]
+        resp = client.post("/threads", json={"metadata": {}, "supersteps": payload})
+        assert resp.status_code == 400
+        assert "graph_id" in resp.json()["detail"]
+
+    def test_supersteps_forwards_via_abulk_update_state(self, client):
+        """End-to-end through ``_apply_supersteps``: graph mocked, verify
+        ``abulk_update_state`` receives the right ``StateUpdate`` shape."""
+        captured_bulk: list = []
+        agent = MagicMock()
+        agent.with_config = MagicMock(return_value=agent)
+
+        async def fake_abulk(_config, supersteps):
+            captured_bulk.extend(supersteps)
+
+        agent.abulk_update_state = AsyncMock(side_effect=fake_abulk)
+
+        svc = MagicMock()
+        svc.get_graph = create_get_graph_mock(return_value=agent)
+
+        payload = [
+            {
+                "updates": [
+                    {"values": {"messages": ["hi"]}, "as_node": "model"},
+                    {"values": {"messages": ["bye"]}, "as_node": "tools", "task_id": "t1"},
+                ]
+            }
+        ]
+        with patch(
+            "aegra_api.services.langgraph_service.get_langgraph_service",
+            return_value=svc,
+        ):
+            resp = client.post(
+                "/threads",
+                json={"metadata": {"graph_id": "agent"}, "supersteps": payload},
+            )
+        assert resp.status_code == 200, resp.json()
+        assert len(captured_bulk) == 1
+        bulk_first = captured_bulk[0]
+        assert len(bulk_first) == 2
+        # StateUpdate is namedtuple-like with (values, as_node, task_id)
+        assert bulk_first[0].as_node == "model"
+        assert bulk_first[0].values == {"messages": ["hi"]}
+        assert bulk_first[1].as_node == "tools"
+        assert bulk_first[1].task_id == "t1"
+
+    def test_supersteps_command_field_accepted_but_not_propagated(self, client):
+        """SDK contract includes ``command``; we accept it in payload but
+        ``StateUpdate`` has no ``command`` slot, so it is dropped on the way
+        to ``abulk_update_state``. This documents the gap honestly."""
+        captured_bulk: list = []
+        agent = MagicMock()
+        agent.with_config = MagicMock(return_value=agent)
+
+        async def fake_abulk(_config, supersteps):
+            captured_bulk.extend(supersteps)
+
+        agent.abulk_update_state = AsyncMock(side_effect=fake_abulk)
+
+        svc = MagicMock()
+        svc.get_graph = create_get_graph_mock(return_value=agent)
+
+        payload = [{"updates": [{"command": {"resume": True}, "as_node": "interrupt"}]}]
+        with patch(
+            "aegra_api.services.langgraph_service.get_langgraph_service",
+            return_value=svc,
+        ):
+            resp = client.post(
+                "/threads",
+                json={"metadata": {"graph_id": "agent"}, "supersteps": payload},
+            )
+        assert resp.status_code == 200
+        # Update reaches abulk_update_state but with values=None (command silently dropped).
+        assert captured_bulk[0][0].values is None
+        assert captured_bulk[0][0].as_node == "interrupt"
