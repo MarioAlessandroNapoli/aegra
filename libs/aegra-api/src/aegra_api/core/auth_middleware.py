@@ -264,6 +264,15 @@ class LangGraphAuthBackend(AuthenticationBackend):
             credentials = AuthCredentials(permissions)
             user = LangGraphUser(user_data)
 
+            # Bind identity + permissions to structlog contextvars so the
+            # outer access-log middleware surfaces them on every log line.
+            # ISO 27018 A.10.1 evidence: who accessed PII with which
+            # privileges.
+            structlog.contextvars.bind_contextvars(
+                identity=user.identity,
+                permissions=permissions,
+            )
+
             logger.debug(f"Successfully authenticated user: {user.identity}")
             return credentials, user
 

@@ -54,7 +54,7 @@ async def create_assistant(
     elif value.get("metadata"):
         request.metadata = {**(request.metadata or {}), **value["metadata"]}
 
-    return await service.create_assistant(request, user.identity)
+    return await service.create_assistant(request, user)
 
 
 @router.get("/assistants", response_model=AssistantList, response_model_by_alias=False)
@@ -76,9 +76,9 @@ async def list_assistants(
     if filters:
         # Convert filters to search request format
         search_request = AssistantSearchRequest(filters=filters)
-        assistants = await service.search_assistants(search_request, user.identity)
+        assistants = await service.search_assistants(search_request, user)
     else:
-        assistants = await service.list_assistants(user.identity)
+        assistants = await service.list_assistants(user)
 
     return AssistantList(assistants=assistants, total=len(assistants))
 
@@ -104,7 +104,7 @@ async def search_assistants(
         request_filters = request.filters or {}
         request.filters = {**request_filters, **filters}
 
-    return await service.search_assistants(request, user.identity)
+    return await service.search_assistants(request, user)
 
 
 @router.post("/assistants/count", response_model=int)
@@ -128,7 +128,7 @@ async def count_assistants(
         request_filters = request.filters or {}
         request.filters = {**request_filters, **filters}
 
-    return await service.count_assistants(request, user.identity)
+    return await service.count_assistants(request, user)
 
 
 @router.get(
@@ -152,7 +152,7 @@ async def get_assistant(
     value = {"assistant_id": assistant_id}
     await handle_event(ctx, value)
 
-    return await service.get_assistant(assistant_id, user.identity)
+    return await service.get_assistant(assistant_id, user)
 
 
 @router.patch(
@@ -183,7 +183,7 @@ async def update_assistant(
     elif value.get("metadata"):
         request.metadata = {**(request.metadata or {}), **value["metadata"]}
 
-    return await service.update_assistant(assistant_id, request, user.identity)
+    return await service.update_assistant(assistant_id, request, user)
 
 
 @router.delete("/assistants/{assistant_id}", responses={**NOT_FOUND})
@@ -202,7 +202,7 @@ async def delete_assistant(
     value = {"assistant_id": assistant_id}
     await handle_event(ctx, value)
 
-    return await service.delete_assistant(assistant_id, user.identity)
+    return await service.delete_assistant(assistant_id, user)
 
 
 @router.post(
@@ -222,7 +222,7 @@ async def set_assistant_latest(
     After calling this endpoint, the assistant will use the specified version's
     configuration when executing runs.
     """
-    return await service.set_assistant_latest(assistant_id, version, user.identity)
+    return await service.set_assistant_latest(assistant_id, version, user)
 
 
 @router.post(
@@ -241,7 +241,7 @@ async def list_assistant_versions(
     Returns versions ordered from newest to oldest. Each version captures the
     assistant's configuration at the time of creation or update.
     """
-    return await service.list_assistant_versions(assistant_id, user.identity)
+    return await service.list_assistant_versions(assistant_id, user)
 
 
 @router.get(

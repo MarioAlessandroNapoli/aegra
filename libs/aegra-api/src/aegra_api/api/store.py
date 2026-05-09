@@ -5,6 +5,7 @@ from fastapi.responses import Response
 
 from aegra_api.core.auth_deps import auth_dependency, get_current_user
 from aegra_api.core.auth_handlers import build_auth_context, handle_event
+from aegra_api.core.auth_helpers import is_admin
 from aegra_api.core.database import db_manager
 from aegra_api.models import (
     StoreDeleteRequest,
@@ -44,7 +45,7 @@ async def put_store_item(request: StorePutRequest, user: User = Depends(get_curr
             request.value = filters["value"]
 
     # Apply user namespace scoping
-    scoped_namespace = apply_user_namespace_scoping(user.identity, request.namespace)
+    scoped_namespace = apply_user_namespace_scoping(user, request.namespace)
 
     store = db_manager.get_store()
 
@@ -87,7 +88,7 @@ async def get_store_item(
         ns_list = []
 
     # Apply user namespace scoping
-    scoped_namespace = apply_user_namespace_scoping(user.identity, ns_list)
+    scoped_namespace = apply_user_namespace_scoping(user, ns_list)
 
     store = db_manager.get_store()
 
@@ -136,7 +137,7 @@ async def delete_store_item(
             k = filters["key"]
 
     # Apply user namespace scoping
-    scoped_namespace = apply_user_namespace_scoping(user.identity, ns)
+    scoped_namespace = apply_user_namespace_scoping(user, ns)
 
     store = db_manager.get_store()
 
@@ -169,7 +170,7 @@ async def search_store_items(
             request.filter = {**(request.filter or {}), **handler_filters}
 
     # Apply user namespace scoping
-    scoped_prefix = apply_user_namespace_scoping(user.identity, request.namespace_prefix)
+    scoped_prefix = apply_user_namespace_scoping(user, request.namespace_prefix)
 
     store = db_manager.get_store()
 
@@ -216,7 +217,7 @@ async def list_namespaces(
             request.suffix = filters["suffix"]
 
     # Apply user namespace scoping to prefix
-    scoped_prefix = apply_user_namespace_scoping(user.identity, request.prefix or [])
+    scoped_prefix = apply_user_namespace_scoping(user, request.prefix or [])
     prefix: tuple[str, ...] = tuple(scoped_prefix)
     suffix: tuple[str, ...] | None = tuple(request.suffix) if request.suffix else None
 
@@ -233,12 +234,20 @@ async def list_namespaces(
     return StoreListNamespacesResponse(namespaces=[list(ns) for ns in result])
 
 
-def apply_user_namespace_scoping(user_id: str, namespace: list[str]) -> list[str]:
+def apply_user_namespace_scoping(user, namespace: list[str]) -> list[str]:
     """Apply user-based namespace scoping for data isolation.
 
     All store operations are scoped to the authenticated user's namespace.
     Users can only access namespaces under ["users", <their_user_id>].
+
+    AE-568: admin identities receive the raw namespace unchanged so they
+    can read/write across tenant boundaries (audit trail in access log).
     """
+    if is_admin(user):
+        return namespace
+
+    user_id = user.identity
+
     if not namespace:
         return ["users", user_id]
 
