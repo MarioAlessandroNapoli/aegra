@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from aegra_api.core.active_runs import active_runs
 from aegra_api.core.auth_deps import auth_dependency, get_current_user
 from aegra_api.core.auth_handlers import build_auth_context, handle_event
+from aegra_api.core.auth_helpers import apply_ownership_filter
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.core.orm import get_session
@@ -183,9 +184,10 @@ async def create_thread(
     thread_id = request.thread_id or str(uuid4())
 
     if request.thread_id:
-        existing_stmt = select(ThreadORM).where(
-            ThreadORM.thread_id == thread_id,
-            ThreadORM.user_id == user.identity,
+        existing_stmt = apply_ownership_filter(
+            select(ThreadORM).where(ThreadORM.thread_id == thread_id),
+            user,
+            ThreadORM,
         )
         existing = await session.scalar(existing_stmt)
 
@@ -235,7 +237,7 @@ async def list_threads(
     filters = await handle_event(ctx, value)
 
     # Build query with filters if provided
-    stmt = select(ThreadORM).where(ThreadORM.user_id == user.identity)
+    stmt = apply_ownership_filter(select(ThreadORM), user, ThreadORM)
     if filters:
         # Apply filters from authorization handler
         # For now, we'll apply user_id filter which is already there
@@ -265,7 +267,7 @@ async def get_thread(
     value = {"thread_id": thread_id}
     await handle_event(ctx, value)
 
-    stmt = select(ThreadORM).where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity)
+    stmt = apply_ownership_filter(select(ThreadORM).where(ThreadORM.thread_id == thread_id), user, ThreadORM)
     thread = await session.scalar(stmt)
     if not thread:
         raise HTTPException(404, f"Thread '{thread_id}' not found")
@@ -299,7 +301,7 @@ async def update_thread(
         if isinstance(handler_meta, dict):
             request.metadata = {**(request.metadata or {}), **handler_meta}
 
-    stmt = select(ThreadORM).where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity)
+    stmt = apply_ownership_filter(select(ThreadORM).where(ThreadORM.thread_id == thread_id), user, ThreadORM)
     thread = await session.scalar(stmt)
 
     if not thread:
@@ -333,7 +335,7 @@ async def get_thread_state(
     executed), returns an empty state.
     """
     try:
-        stmt = select(ThreadORM).where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity)
+        stmt = apply_ownership_filter(select(ThreadORM).where(ThreadORM.thread_id == thread_id), user, ThreadORM)
         thread = await session.scalar(stmt)
         if not thread:
             raise HTTPException(404, f"Thread '{thread_id}' not found")
@@ -451,7 +453,7 @@ async def update_thread_state(
         )
 
     try:
-        stmt = select(ThreadORM).where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity)
+        stmt = apply_ownership_filter(select(ThreadORM).where(ThreadORM.thread_id == thread_id), user, ThreadORM)
         thread = await session.scalar(stmt)
         if not thread:
             raise HTTPException(404, f"Thread '{thread_id}' not found")
@@ -578,7 +580,7 @@ async def get_thread_state_at_checkpoint(
     execution history. Returns 404 if the checkpoint does not exist.
     """
     try:
-        stmt = select(ThreadORM).where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity)
+        stmt = apply_ownership_filter(select(ThreadORM).where(ThreadORM.thread_id == thread_id), user, ThreadORM)
         thread = await session.scalar(stmt)
         if not thread:
             raise HTTPException(404, f"Thread '{thread_id}' not found")
@@ -698,7 +700,7 @@ async def get_thread_history_post(
         subgraphs = bool(request.subgraphs) if request.subgraphs is not None else False
         checkpoint_ns = request.checkpoint_ns
 
-        stmt = select(ThreadORM).where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity)
+        stmt = apply_ownership_filter(select(ThreadORM).where(ThreadORM.thread_id == thread_id), user, ThreadORM)
         thread = await session.scalar(stmt)
         if not thread:
             raise HTTPException(404, f"Thread '{thread_id}' not found")
@@ -826,15 +828,18 @@ async def delete_thread(
     value = {"thread_id": thread_id}
     await handle_event(ctx, value)
 
-    stmt = select(ThreadORM).where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity)
+    stmt = apply_ownership_filter(select(ThreadORM).where(ThreadORM.thread_id == thread_id), user, ThreadORM)
     thread = await session.scalar(stmt)
     if not thread:
         raise HTTPException(404, f"Thread '{thread_id}' not found")
 
-    active_runs_stmt = select(RunORM).where(
-        RunORM.thread_id == thread_id,
-        RunORM.user_id == user.identity,
-        RunORM.status.in_(["pending", "running"]),
+    active_runs_stmt = apply_ownership_filter(
+        select(RunORM).where(
+            RunORM.thread_id == thread_id,
+            RunORM.status.in_(["pending", "running"]),
+        ),
+        user,
+        RunORM,
     )
     active_runs_list = (await session.scalars(active_runs_stmt)).all()
 
@@ -947,7 +952,7 @@ async def search_threads(
         if isinstance(handler_meta, dict):
             request.metadata = {**(request.metadata or {}), **handler_meta}
         # Other filter types can be handled here if needed
-    stmt = select(ThreadORM).where(ThreadORM.user_id == user.identity)
+    stmt = apply_ownership_filter(select(ThreadORM), user, ThreadORM)
 
     if request.status:
         stmt = stmt.where(ThreadORM.status == request.status)

@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from aegra_api.core.auth_deps import get_current_user
 from aegra_api.core.auth_filters import build_metadata_filter
+from aegra_api.core.auth_helpers import is_admin
 from aegra_api.core.orm import Assistant as AssistantORM
 from aegra_api.core.orm import AssistantVersion as AssistantVersionORM
 from aegra_api.core.orm import get_session
@@ -202,12 +203,13 @@ class AssistantService(Authenticated):
 
         # Check if an assistant already exists for this user, graph and config pair
         existing_stmt = select(AssistantORM).where(
-            AssistantORM.user_id == self.user.identity,
             or_(
                 (AssistantORM.graph_id == graph_id) & (AssistantORM.config == config),
                 AssistantORM.assistant_id == assistant_id,
             ),
         )
+        if not is_admin(self.user):
+            existing_stmt = existing_stmt.where(AssistantORM.user_id == self.user.identity)
         existing = await self.session.scalar(existing_stmt)
 
         if existing:
@@ -260,9 +262,9 @@ class AssistantService(Authenticated):
         value: dict[str, Any] = {}
         filters = await self._dispatch("search", value)
 
-        stmt = select(AssistantORM).where(
-            or_(AssistantORM.user_id == self.user.identity, AssistantORM.user_id == "system")
-        )
+        stmt = select(AssistantORM)
+        if not is_admin(self.user):
+            stmt = stmt.where(or_(AssistantORM.user_id == self.user.identity, AssistantORM.user_id == "system"))
         auth_filter = build_metadata_filter(AssistantORM.metadata_dict, filters)
         if auth_filter is not None:
             stmt = stmt.where(auth_filter)
@@ -280,9 +282,9 @@ class AssistantService(Authenticated):
         value = request.model_dump()
         filters = await self._dispatch("search", value)
 
-        stmt = select(AssistantORM).where(
-            or_(AssistantORM.user_id == self.user.identity, AssistantORM.user_id == "system")
-        )
+        stmt = select(AssistantORM)
+        if not is_admin(self.user):
+            stmt = stmt.where(or_(AssistantORM.user_id == self.user.identity, AssistantORM.user_id == "system"))
 
         if request.name:
             stmt = stmt.where(AssistantORM.name.ilike(f"%{_escape_like(request.name)}%", escape="\\"))
@@ -319,9 +321,9 @@ class AssistantService(Authenticated):
         filters = await self._dispatch("search", value)
 
         # Include both user's assistants and system assistants (like search_assistants does)
-        stmt = select(func.count()).where(
-            or_(AssistantORM.user_id == self.user.identity, AssistantORM.user_id == "system")
-        )
+        stmt = select(func.count())
+        if not is_admin(self.user):
+            stmt = stmt.where(or_(AssistantORM.user_id == self.user.identity, AssistantORM.user_id == "system"))
 
         if request.name:
             stmt = stmt.where(AssistantORM.name.ilike(f"%{_escape_like(request.name)}%", escape="\\"))
@@ -351,10 +353,9 @@ class AssistantService(Authenticated):
         """
         filters = await self._dispatch("read", {"assistant_id": assistant_id})
 
-        stmt = select(AssistantORM).where(
-            AssistantORM.assistant_id == assistant_id,
-            or_(AssistantORM.user_id == self.user.identity, AssistantORM.user_id == "system"),
-        )
+        stmt = select(AssistantORM).where(AssistantORM.assistant_id == assistant_id)
+        if not is_admin(self.user):
+            stmt = stmt.where(or_(AssistantORM.user_id == self.user.identity, AssistantORM.user_id == "system"))
         auth_filter = build_metadata_filter(AssistantORM.metadata_dict, filters)
         if auth_filter is not None:
             stmt = stmt.where(auth_filter)
@@ -390,10 +391,9 @@ class AssistantService(Authenticated):
         elif context:
             config["configurable"] = context
 
-        stmt = select(AssistantORM).where(
-            AssistantORM.assistant_id == assistant_id,
-            AssistantORM.user_id == self.user.identity,
-        )
+        stmt = select(AssistantORM).where(AssistantORM.assistant_id == assistant_id)
+        if not is_admin(self.user):
+            stmt = stmt.where(AssistantORM.user_id == self.user.identity)
         auth_filter = build_metadata_filter(AssistantORM.metadata_dict, filters)
         if auth_filter is not None:
             stmt = stmt.where(auth_filter)
@@ -424,22 +424,18 @@ class AssistantService(Authenticated):
         self.session.add(assistant_version_orm)
         await self.session.commit()
 
-        assistant_update = (
-            update(AssistantORM)
-            .where(
-                AssistantORM.assistant_id == assistant_id,
-                AssistantORM.user_id == self.user.identity,
-            )
-            .values(
-                name=new_version_details["name"],
-                description=new_version_details["description"],
-                graph_id=new_version_details["graph_id"],
-                config=new_version_details["config"],
-                context=new_version_details["context"],
-                metadata_dict=new_version_details["metadata_dict"],
-                version=new_version,
-                updated_at=now,
-            )
+        assistant_update = update(AssistantORM).where(AssistantORM.assistant_id == assistant_id)
+        if not is_admin(self.user):
+            assistant_update = assistant_update.where(AssistantORM.user_id == self.user.identity)
+        assistant_update = assistant_update.values(
+            name=new_version_details["name"],
+            description=new_version_details["description"],
+            graph_id=new_version_details["graph_id"],
+            config=new_version_details["config"],
+            context=new_version_details["context"],
+            metadata_dict=new_version_details["metadata_dict"],
+            version=new_version,
+            updated_at=now,
         )
         await self.session.execute(assistant_update)
         await self.session.commit()
@@ -450,10 +446,9 @@ class AssistantService(Authenticated):
         """Delete assistant by ID"""
         filters = await self._dispatch("delete", {"assistant_id": assistant_id})
 
-        stmt = select(AssistantORM).where(
-            AssistantORM.assistant_id == assistant_id,
-            AssistantORM.user_id == self.user.identity,
-        )
+        stmt = select(AssistantORM).where(AssistantORM.assistant_id == assistant_id)
+        if not is_admin(self.user):
+            stmt = stmt.where(AssistantORM.user_id == self.user.identity)
         auth_filter = build_metadata_filter(AssistantORM.metadata_dict, filters)
         if auth_filter is not None:
             stmt = stmt.where(auth_filter)
@@ -471,10 +466,9 @@ class AssistantService(Authenticated):
         """Set the given version as the latest version of an assistant"""
         filters = await self._dispatch("update", {"assistant_id": assistant_id, "version": version})
 
-        stmt = select(AssistantORM).where(
-            AssistantORM.assistant_id == assistant_id,
-            AssistantORM.user_id == self.user.identity,
-        )
+        stmt = select(AssistantORM).where(AssistantORM.assistant_id == assistant_id)
+        if not is_admin(self.user):
+            stmt = stmt.where(AssistantORM.user_id == self.user.identity)
         auth_filter = build_metadata_filter(AssistantORM.metadata_dict, filters)
         if auth_filter is not None:
             stmt = stmt.where(auth_filter)
@@ -490,22 +484,18 @@ class AssistantService(Authenticated):
         if not assistant_version:
             raise HTTPException(404, f"Version '{version}' for Assistant '{assistant_id}' not found")
 
-        assistant_update = (
-            update(AssistantORM)
-            .where(
-                AssistantORM.assistant_id == assistant_id,
-                AssistantORM.user_id == self.user.identity,
-            )
-            .values(
-                name=assistant_version.name,
-                description=assistant_version.description,
-                config=assistant_version.config,
-                context=assistant_version.context,
-                graph_id=assistant_version.graph_id,
-                metadata_dict=assistant_version.metadata_dict,
-                version=version,
-                updated_at=datetime.now(UTC),
-            )
+        assistant_update = update(AssistantORM).where(AssistantORM.assistant_id == assistant_id)
+        if not is_admin(self.user):
+            assistant_update = assistant_update.where(AssistantORM.user_id == self.user.identity)
+        assistant_update = assistant_update.values(
+            name=assistant_version.name,
+            description=assistant_version.description,
+            config=assistant_version.config,
+            context=assistant_version.context,
+            graph_id=assistant_version.graph_id,
+            metadata_dict=assistant_version.metadata_dict,
+            version=version,
+            updated_at=datetime.now(UTC),
         )
         await self.session.execute(assistant_update)
         await self.session.commit()
@@ -518,10 +508,9 @@ class AssistantService(Authenticated):
         # with the {assistant_id, metadata} value shape.
         filters = await self._dispatch("search", {"assistant_id": assistant_id, "metadata": None})
 
-        stmt = select(AssistantORM).where(
-            AssistantORM.assistant_id == assistant_id,
-            or_(AssistantORM.user_id == self.user.identity, AssistantORM.user_id == "system"),
-        )
+        stmt = select(AssistantORM).where(AssistantORM.assistant_id == assistant_id)
+        if not is_admin(self.user):
+            stmt = stmt.where(or_(AssistantORM.user_id == self.user.identity, AssistantORM.user_id == "system"))
         auth_filter = build_metadata_filter(AssistantORM.metadata_dict, filters)
         if auth_filter is not None:
             stmt = stmt.where(auth_filter)
