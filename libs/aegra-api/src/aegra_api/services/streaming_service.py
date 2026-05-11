@@ -10,6 +10,7 @@ from aegra_api.core.sse import create_error_event
 from aegra_api.models import Run
 from aegra_api.services.broker import broker_manager
 from aegra_api.services.event_converter import EventConverter
+from aegra_api.settings import settings
 from aegra_api.utils import extract_event_sequence
 
 logger = structlog.getLogger(__name__)
@@ -130,7 +131,17 @@ class StreamingService:
                 yield event_id, sse_event
 
     async def _stream_live_events(self, run: Run, last_sent_sequence: int) -> AsyncIterator[str]:
-        """Stream live events from broker."""
+        """Stream live events from broker, emitting SSE heartbeat comments when idle.
+
+        Wraps ``broker.aiter()`` with ``asyncio.wait_for`` so that, when the worker
+        is busy with internal operations that emit no broker events (LLM thinking
+        pre-token, large-context tokenization, parallel upstream calls, server-side
+        tool execution), the server still emits a W3C SSE comment ``: heartbeat\\n\\n``
+        every ``KEEPALIVE_INTERVAL_SECS``. Spec-compliant clients ignore comment
+        lines, so this is transparent to the LangGraph SDK / browser EventSource.
+        Without it, GCP GFE / Cloud Run / AWS ALB / Cloudflare drop idle TCP
+        connections (~30-60s), causing premature ``StopAsyncIteration`` upstream.
+        """
         run_id = run.run_id
         broker = broker_manager.get_broker(run_id)
 
@@ -143,16 +154,37 @@ class StreamingService:
         if broker is None:
             broker = broker_manager.get_or_create_broker(run_id)
 
-        async for event_id, raw_event in broker.aiter():
-            # Skip duplicates that were already replayed
-            current_sequence = extract_event_sequence(event_id)
-            if current_sequence <= last_sent_sequence:
-                continue
+        interval = settings.app.KEEPALIVE_INTERVAL_SECS
+        broker_iter = broker.aiter().__aiter__()
+        pending: asyncio.Task[tuple[str, Any]] | None = None
+        try:
+            while True:
+                # Use a persistent task + shield so wait_for timeouts emit
+                # heartbeats without cancelling the underlying broker iterator.
+                if pending is None:
+                    pending = asyncio.ensure_future(broker_iter.__anext__())
+                try:
+                    event_id, raw_event = await asyncio.wait_for(asyncio.shield(pending), timeout=interval)
+                except TimeoutError:
+                    yield ": heartbeat\n\n"
+                    continue
+                except StopAsyncIteration:
+                    pending = None
+                    return
+                pending = None
 
-            sse_event = await self._convert_raw_to_sse(event_id, raw_event)
-            if sse_event:
-                yield sse_event
-                last_sent_sequence = current_sequence
+                # Skip duplicates that were already replayed
+                current_sequence = extract_event_sequence(event_id)
+                if current_sequence <= last_sent_sequence:
+                    continue
+
+                sse_event = await self._convert_raw_to_sse(event_id, raw_event)
+                if sse_event:
+                    yield sse_event
+                    last_sent_sequence = current_sequence
+        finally:
+            if pending is not None and not pending.done():
+                pending.cancel()
 
     async def interrupt_run(self, run_id: str) -> bool:
         """Interrupt a running execution.

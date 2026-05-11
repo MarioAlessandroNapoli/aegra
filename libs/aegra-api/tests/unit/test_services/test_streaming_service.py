@@ -1,5 +1,6 @@
 """Unit tests for streaming_service module"""
 
+import asyncio
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
 from typing import Any
@@ -9,6 +10,7 @@ import pytest
 
 from aegra_api.models import Run
 from aegra_api.services.streaming_service import StreamingService
+from aegra_api.settings import settings as aegra_settings
 
 
 @pytest.mark.asyncio
@@ -387,3 +389,96 @@ class TestStreamingService:
         with patch("aegra_api.services.streaming_service.broker_manager") as mock_manager:
             await service.cleanup_run(run_id)
             mock_manager.cleanup_broker.assert_called_with(run_id)
+
+    async def test_stream_emits_heartbeat_when_broker_idle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Idle broker > KEEPALIVE_INTERVAL_SECS emits SSE comment ``: heartbeat\\n\\n``.
+
+        Regression test for premature TCP close on long-running workers (GFE,
+        Cloud Run, AWS ALB, Cloudflare all reap idle TCP at ~30-60s). Heartbeat
+        comments are W3C SSE format ignored by spec-compliant clients but
+        sufficient to keep the connection alive.
+        """
+        # Arrange: compress keepalive so the test completes in ~0.2s
+        monkeypatch.setattr(aegra_settings.app, "KEEPALIVE_INTERVAL_SECS", 0.05)
+        service = StreamingService()
+        run = Run(
+            run_id="run-123",
+            status="running",
+            user_id="user-1",
+            thread_id="thread-1",
+            assistant_id="agent",
+            input={"message": "hello"},
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        mock_broker = MagicMock()
+        mock_broker.is_finished.return_value = False
+        mock_broker.replay = AsyncMock(return_value=[])
+
+        async def slow_aiter() -> AsyncGenerator[tuple[str, Any], None]:
+            # Simulate worker doing internal ops without emitting broker events
+            # (count_tokens on large context, parallel upstream calls, etc.)
+            await asyncio.sleep(0.18)  # ~3.6x KEEPALIVE_INTERVAL_SECS
+            yield "run-123_event_1", ("values", {"a": 1})
+            yield "run-123_event_2", ("end", {"status": "success"})
+
+        mock_broker.aiter = slow_aiter
+
+        # Act
+        with patch("aegra_api.services.streaming_service.broker_manager") as mock_manager:
+            mock_manager.get_or_create_broker.return_value = mock_broker
+            mock_manager.get_broker.return_value = mock_broker
+            service._convert_raw_to_sse = AsyncMock(side_effect=["data1", "data2"])  # type: ignore[assignment]
+            events: list[str] = []
+            async for event in service.stream_run_execution(run):
+                events.append(event)
+
+        # Assert
+        heartbeats = [e for e in events if e == ": heartbeat\n\n"]
+        data_events = [e for e in events if e != ": heartbeat\n\n"]
+        assert len(heartbeats) >= 2, f"Expected >=2 heartbeats during 0.18s idle, got {len(heartbeats)}: {events}"
+        assert data_events == ["data1", "data2"]
+        # All events emitted before first data must be heartbeats (idle precedes emit)
+        first_data_idx = events.index("data1")
+        assert all(e == ": heartbeat\n\n" for e in events[:first_data_idx]), events[: first_data_idx + 1]
+
+    async def test_stream_no_heartbeat_when_broker_active(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When broker emits events faster than KEEPALIVE_INTERVAL_SECS, no heartbeats fire.
+
+        Confirms heartbeat is a safety-net (only fires on idle), not an unconditional
+        side-channel that would add noise to chunk-dense streams.
+        """
+        # Arrange: small but non-zero keepalive; broker yields instantly
+        monkeypatch.setattr(aegra_settings.app, "KEEPALIVE_INTERVAL_SECS", 1.0)
+        service = StreamingService()
+        run = Run(
+            run_id="run-123",
+            status="running",
+            user_id="user-1",
+            thread_id="thread-1",
+            assistant_id="agent",
+            input={"message": "hello"},
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        mock_broker = MagicMock()
+        mock_broker.is_finished.return_value = False
+        mock_broker.replay = AsyncMock(return_value=[])
+
+        async def fast_aiter() -> AsyncGenerator[tuple[str, Any], None]:
+            yield "run-123_event_1", ("values", {"a": 1})
+            yield "run-123_event_2", ("end", {"status": "success"})
+
+        mock_broker.aiter = fast_aiter
+
+        # Act
+        with patch("aegra_api.services.streaming_service.broker_manager") as mock_manager:
+            mock_manager.get_or_create_broker.return_value = mock_broker
+            mock_manager.get_broker.return_value = mock_broker
+            service._convert_raw_to_sse = AsyncMock(side_effect=["data1", "data2"])  # type: ignore[assignment]
+            events: list[str] = []
+            async for event in service.stream_run_execution(run):
+                events.append(event)
+
+        # Assert
+        assert events == ["data1", "data2"], f"Expected no heartbeats on active stream, got {events}"
