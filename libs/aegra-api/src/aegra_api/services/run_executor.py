@@ -167,11 +167,18 @@ async def _stream_graph(job: RunJob) -> _GraphResult:
 
 def _build_run_config(job: RunJob) -> dict[str, Any]:
     """Assemble the LangGraph run config from a RunJob."""
+    # AE-552 F6: user-supplied run_metadata must reach create_run_config so the
+    # reserved `session_id` override survives the observability merge.
+    additional = dict(job.execution.config) if job.execution.config else {}
+    if job.run_metadata:
+        merged_meta = dict(additional.get("metadata") or {})
+        merged_meta.update(job.run_metadata)
+        additional["metadata"] = merged_meta
     config = create_run_config(
         job.identity.run_id,
         job.identity.thread_id,
         job.user,
-        additional_config=job.execution.config,
+        additional_config=additional,
         checkpoint=job.execution.checkpoint,
     )
     if job.behavior.interrupt_before is not None:
