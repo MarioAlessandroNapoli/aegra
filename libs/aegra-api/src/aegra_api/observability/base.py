@@ -16,8 +16,20 @@ class ObservabilityProvider(ABC):
         pass
 
     @abstractmethod
-    def get_metadata(self, run_id: str, thread_id: str, user_identity: str | None = None) -> dict[str, Any]:
-        """Return metadata to be added to the run configuration."""
+    def get_metadata(
+        self,
+        run_id: str,
+        thread_id: str,
+        user_identity: str | None = None,
+        *,
+        session_override: str | None = None,
+    ) -> dict[str, Any]:
+        """Return metadata to be added to the run configuration.
+
+        ``session_override`` (AE-552 F6): when supplied, overrides the default
+        session_id (= thread_id) so worker traces of one user turn can rejoin
+        the main thread's Langfuse session.
+        """
         pass
 
     @abstractmethod
@@ -57,12 +69,21 @@ class ObservabilityManager:
                 logger.error(f"Failed to get callbacks from {provider.__class__.__name__}: {e}")
         return callbacks
 
-    def get_all_metadata(self, run_id: str, thread_id: str, user_identity: str | None = None) -> dict[str, Any]:
+    def get_all_metadata(
+        self,
+        run_id: str,
+        thread_id: str,
+        user_identity: str | None = None,
+        *,
+        session_override: str | None = None,
+    ) -> dict[str, Any]:
         """Get metadata from all enabled providers."""
         metadata = {}
         for provider in self._providers:
             try:
-                provider_metadata = provider.get_metadata(run_id, thread_id, user_identity)
+                provider_metadata = provider.get_metadata(
+                    run_id, thread_id, user_identity, session_override=session_override
+                )
                 metadata.update(provider_metadata)
             except Exception as e:
                 logger.error(f"Failed to get metadata from {provider.__class__.__name__}: {e}")
@@ -83,6 +104,14 @@ def get_tracing_callbacks() -> list[Any]:
     return _observability_manager.get_all_callbacks()
 
 
-def get_tracing_metadata(run_id: str, thread_id: str, user_identity: str | None = None) -> dict[str, Any]:
+def get_tracing_metadata(
+    run_id: str,
+    thread_id: str,
+    user_identity: str | None = None,
+    *,
+    session_override: str | None = None,
+) -> dict[str, Any]:
     """Get metadata from all registered observability providers."""
-    return _observability_manager.get_all_metadata(run_id, thread_id, user_identity)
+    return _observability_manager.get_all_metadata(
+        run_id, thread_id, user_identity, session_override=session_override
+    )

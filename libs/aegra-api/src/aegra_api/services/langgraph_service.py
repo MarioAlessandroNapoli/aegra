@@ -744,19 +744,17 @@ def create_run_config(
         # Combine existing callbacks with new tracing callbacks to be non-destructive
         cfg["callbacks"] = existing_callbacks + tracing_callbacks
 
-    # Add metadata from all observability providers (independent of callbacks)
+    # Add metadata from all observability providers (independent of callbacks).
+    # F6 (AE-552): user-supplied `session_id` override is extracted before merge
+    # and forwarded to providers so it lands as the top-level session for both
+    # OTEL span attrs and the Langfuse CallbackHandler metadata channel.
     cfg.setdefault("metadata", {})
     user_identity = user.identity if user else None
-    # F6 (AE-552): snapshot user-supplied session_id override before observability
-    # defaults overwrite it. PR #313 metadata path otherwise wins over the OTEL
-    # span attribute, surfacing thread_id as Langfuse trace.session_id.
     session_override, _ = extract_trace_overrides(cfg["metadata"])
-    observability_metadata = get_tracing_metadata(run_id, thread_id, user_identity)
+    observability_metadata = get_tracing_metadata(
+        run_id, thread_id, user_identity, session_override=session_override
+    )
     cfg["metadata"].update(observability_metadata)
-    if session_override:
-        cfg["metadata"]["session_id"] = session_override
-        if "langfuse_session_id" in cfg["metadata"]:
-            cfg["metadata"]["langfuse_session_id"] = session_override
 
     # Apply checkpoint parameters if provided
     if checkpoint and isinstance(checkpoint, dict):

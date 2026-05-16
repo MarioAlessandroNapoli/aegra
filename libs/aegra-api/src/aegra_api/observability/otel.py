@@ -130,14 +130,22 @@ class OpenTelemetryProvider(ObservabilityProvider):
             self.setup()
         return []
 
-    def get_metadata(self, run_id: str, thread_id: str, user_identity: str | None = None) -> dict[str, Any]:
+    def get_metadata(
+        self,
+        run_id: str,
+        thread_id: str,
+        user_identity: str | None = None,
+        *,
+        session_override: str | None = None,
+    ) -> dict[str, Any]:
         if not self.is_enabled():
             return {}
 
+        session_id = session_override or thread_id
         meta: dict[str, Any] = {
             "run_id": run_id,
             "thread_id": thread_id,
-            "session_id": thread_id,
+            "session_id": session_id,
         }
         if user_identity:
             meta["user_id"] = user_identity
@@ -145,7 +153,7 @@ class OpenTelemetryProvider(ObservabilityProvider):
         if self._has_langfuse:
             # Langfuse CallbackHandler only promotes langfuse_* prefixed keys
             # to trace-level fields; plain session_id stays in generic metadata.
-            meta["langfuse_session_id"] = thread_id
+            meta["langfuse_session_id"] = session_id
             if user_identity:
                 meta["langfuse_user_id"] = user_identity
 
