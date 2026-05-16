@@ -26,7 +26,11 @@ from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import _get_session_maker
 from aegra_api.core.redis_manager import redis_manager
 from aegra_api.models.run_job import RunJob
-from aegra_api.observability.span_enrichment import merge_run_metadata, set_trace_context
+from aegra_api.observability.span_enrichment import (
+    extract_trace_overrides,
+    merge_run_metadata,
+    set_trace_context,
+)
 from aegra_api.services.base_executor import BaseExecutor
 from aegra_api.services.run_executor import _lease_loss_cancellations, execute_run
 from aegra_api.services.run_status import finalize_run, update_run_status
@@ -469,12 +473,19 @@ def _restore_trace_context(run_id: str, job: RunJob, trace: dict[str, str]) -> N
     jobs processed by the same worker.  User-supplied ``run_metadata`` is
     merged with the system runtime keys; system keys win on collision —
     see :func:`merge_run_metadata`.
+
+    When ``AEGRA_TRACE_METADATA_OVERRIDES`` is enabled, the reserved
+    ``session_id`` key in ``run_metadata`` overrides the default top-level
+    session attribute (``thread_id``) — see :func:`extract_trace_overrides`.
     """
     structlog.contextvars.clear_contextvars()
 
     original_request_id = trace.get("correlation_id", "")
     if original_request_id:
         correlation_id.set(original_request_id)
+
+    session_override, remaining_metadata = extract_trace_overrides(job.run_metadata)
+    effective_session_id = session_override or job.identity.thread_id
 
     system_metadata: dict[str, str | int | float | bool] = {
         "run_id": run_id,
@@ -489,9 +500,9 @@ def _restore_trace_context(run_id: str, job: RunJob, trace: dict[str, str]) -> N
         system_metadata["original_request_id"] = original_request_id
     set_trace_context(
         user_id=job.user.identity,
-        session_id=job.identity.thread_id,
+        session_id=effective_session_id,
         trace_name=job.identity.graph_id,
-        metadata=merge_run_metadata(job.run_metadata, system_metadata),
+        metadata=merge_run_metadata(remaining_metadata, system_metadata),
     )
 
     structlog.contextvars.bind_contextvars(
@@ -499,5 +510,6 @@ def _restore_trace_context(run_id: str, job: RunJob, trace: dict[str, str]) -> N
         thread_id=job.identity.thread_id,
         graph_id=job.identity.graph_id,
         user_id=job.user.identity,
+        session_id=effective_session_id,
         original_request_id=original_request_id,
     )

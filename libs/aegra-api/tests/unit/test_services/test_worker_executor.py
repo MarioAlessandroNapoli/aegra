@@ -440,6 +440,55 @@ class TestRestoreTraceContext:
         assert "original_request_id" not in metadata
         assert set(metadata.keys()) == {"run_id", "thread_id", "graph_id"}
 
+    def test_session_override_applied_when_flag_on(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Worker path honours session_id override + binds it to structlog."""
+        monkeypatch.setenv("AEGRA_TRACE_METADATA_OVERRIDES", "true")
+        job = RunJob(
+            identity=RunIdentity(
+                run_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                thread_id="11111111-2222-3333-4444-555555555555",
+                graph_id="test-graph",
+            ),
+            user=User(identity="test-user"),
+            run_metadata={"session_id": "biz-session-9"},
+        )
+        trace = {"correlation_id": "req-abc"}
+
+        with (
+            patch(f"{MODULE}.set_trace_context") as mock_set_trace,
+            patch(f"{MODULE}.structlog.contextvars.bind_contextvars") as mock_bind,
+        ):
+            _restore_trace_context("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", job, trace)
+
+        assert mock_set_trace.call_args.kwargs["session_id"] == "biz-session-9"
+        # session_id key is popped, never reaches metadata sub-fields.
+        assert "session_id" not in mock_set_trace.call_args.kwargs["metadata"]
+        assert mock_bind.call_args.kwargs["session_id"] == "biz-session-9"
+
+    def test_session_override_ignored_when_flag_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Flag off: override key surfaces as plain metadata; session_id defaults to thread_id."""
+        monkeypatch.delenv("AEGRA_TRACE_METADATA_OVERRIDES", raising=False)
+        job = RunJob(
+            identity=RunIdentity(
+                run_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                thread_id="11111111-2222-3333-4444-555555555555",
+                graph_id="test-graph",
+            ),
+            user=User(identity="test-user"),
+            run_metadata={"session_id": "ignored"},
+        )
+        trace = {"correlation_id": "req-abc"}
+
+        with (
+            patch(f"{MODULE}.set_trace_context") as mock_set_trace,
+            patch(f"{MODULE}.structlog.contextvars.bind_contextvars") as mock_bind,
+        ):
+            _restore_trace_context("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", job, trace)
+
+        assert mock_set_trace.call_args.kwargs["session_id"] == "11111111-2222-3333-4444-555555555555"
+        assert mock_set_trace.call_args.kwargs["metadata"]["session_id"] == "ignored"
+        assert mock_bind.call_args.kwargs["session_id"] == "11111111-2222-3333-4444-555555555555"
+
 
 # ------------------------------------------------------------------
 # WorkerExecutor.submit

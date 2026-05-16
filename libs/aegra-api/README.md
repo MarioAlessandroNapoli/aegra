@@ -103,6 +103,8 @@ OPENAI_API_KEY=sk-...
 
 # Observability (optional)
 OTEL_TARGETS=LANGFUSE,PHOENIX
+# Opt-in: promote run metadata `session_id` to the top-level Langfuse session.
+AEGRA_TRACE_METADATA_OVERRIDES=false
 ```
 
 ## API Endpoints

@@ -32,6 +32,7 @@ from aegra_api.middleware import ContentTypeFixMiddleware, StructLogMiddleware
 from aegra_api.models.errors import AgentProtocolError, get_error_type
 from aegra_api.observability.metrics import setup_prometheus_metrics
 from aegra_api.observability.setup import setup_observability
+from aegra_api.observability.span_enrichment import metadata_overrides_enabled
 from aegra_api.services.broker import broker_manager
 from aegra_api.services.executor import executor
 from aegra_api.services.langgraph_service import get_langgraph_service
@@ -94,6 +95,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
     # Observability
     setup_observability()
+    logger.info(
+        "reserved metadata override flag resolved",
+        metadata_overrides_enabled=metadata_overrides_enabled(),
+    )
 
     # Initialize LangGraph service
     langgraph_service = get_langgraph_service()
