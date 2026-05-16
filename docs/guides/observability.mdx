@@ -139,6 +139,16 @@ Aegra injects a small number of runtime keys into the same metadata stream so th
 
 If the request `metadata` contains a key already populated by the runtime, the system value wins, the user value is dropped, and a warning is logged from `aegra_api.observability.span_enrichment`. This makes the OTEL view a reliable join key with logs and the runs table; user audit fidelity is preserved by keeping the original payload in `execution_params.run_metadata`.
 
+### Reserved override keys (opt-in)
+
+Set `AEGRA_TRACE_METADATA_OVERRIDES=true` to opt into user-wins semantics for a small reserved set of metadata keys. When enabled, these keys are extracted from the request `metadata` before merge and override the corresponding top-level OTEL attribute:
+
+- `session_id` — overrides `langfuse.session.id` / `session.id` (default: `thread_id`)
+
+This is useful for multi-agent topologies where a parent run's identifier should group all worker runs under the same Langfuse session, regardless of which thread each worker runs on. Without the flag (the default), `session_id` is treated as a regular sub-field metadata key and surfaces as `langfuse.trace.metadata.session_id`.
+
+Override values are validated independently of the `RunCreate` field validator (non-string, non-printable, or > 256-char values are dropped with a warning), providing a defense-in-depth guard for paths that store metadata in JSONB and bypass the request-time validator.
+
 ## Key environment variables
 
 The main variables you'll need:
@@ -148,6 +158,7 @@ The main variables you'll need:
 | `OTEL_TARGETS` | Comma-separated list of backends: `LANGFUSE`, `PHOENIX`, `GENERIC` |
 | `OTEL_SERVICE_NAME` | Service name for traces (default: `aegra-backend`) |
 | `OTEL_CONSOLE_EXPORT` | Log traces to console (`true`/`false`) |
+| `AEGRA_TRACE_METADATA_OVERRIDES` | Opt-in user-wins for reserved metadata keys: `session_id` (default: `false`) |
 
 Each provider has its own set of variables (endpoints, API keys). See the [environment variables reference](/reference/environment-variables) for the full list including all Langfuse, Phoenix, and generic OTLP variables.
 

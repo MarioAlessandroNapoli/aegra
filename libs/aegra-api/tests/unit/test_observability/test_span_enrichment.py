@@ -14,6 +14,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
 from aegra_api.observability.span_enrichment import (
     SpanEnrichmentProcessor,
     _trace_attrs,
+    extract_trace_overrides,
     make_run_trace_context,
     merge_run_metadata,
     set_trace_context,
@@ -538,3 +539,185 @@ class TestSpanEnrichmentEndToEnd:
             assert attrs["langfuse.session.id"] == "thread-1"
             assert attrs["langfuse.trace.name"] == "my_graph"
             assert attrs["langfuse.trace.metadata.run_id"] == "run-1"
+
+
+class TestSessionIdOverride:
+    """Tests for the session_id metadata override (env-gated, F6).
+
+    Verifies the opt-in behavior of ``extract_trace_overrides`` and its
+    end-to-end effect on ``make_run_trace_context``. When
+    ``AEGRA_TRACE_METADATA_OVERRIDES`` is enabled, the reserved key
+    ``session_id`` in ``extra_metadata`` overrides the default top-level
+    session attribute (``thread_id``).
+    """
+
+    _ENV_FLAG = "AEGRA_TRACE_METADATA_OVERRIDES"
+
+    def setup_method(self) -> None:
+        """Reset context var before each test."""
+        _trace_attrs.set(None)
+
+    def test_override_disabled_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Env flag absent → session_id treated as regular sub-field metadata."""
+        monkeypatch.delenv(self._ENV_FLAG, raising=False)
+
+        session_override, remaining = extract_trace_overrides({"session_id": "biz-42", "tenant": "acme"})
+
+        assert session_override is None
+        assert remaining == {"session_id": "biz-42", "tenant": "acme"}
+
+    def test_override_enabled_pops_session_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Env flag on + valid string → session_id popped, remaining preserved."""
+        monkeypatch.setenv(self._ENV_FLAG, "true")
+
+        session_override, remaining = extract_trace_overrides({"session_id": "biz-42", "tenant": "acme"})
+
+        assert session_override == "biz-42"
+        assert remaining == {"tenant": "acme"}
+
+    @pytest.mark.parametrize("flag_value", ["true", "TRUE", "1", "yes", "Yes"])
+    def test_override_env_flag_truthy_variants(self, monkeypatch: pytest.MonkeyPatch, flag_value: str) -> None:
+        """Accepted truthy spellings all activate the override."""
+        monkeypatch.setenv(self._ENV_FLAG, flag_value)
+
+        session_override, _ = extract_trace_overrides({"session_id": "x"})
+
+        assert session_override == "x"
+
+    @pytest.mark.parametrize("flag_value", ["false", "0", "no", "", "off"])
+    def test_override_env_flag_falsy_variants(self, monkeypatch: pytest.MonkeyPatch, flag_value: str) -> None:
+        """Falsy or unrecognized spellings leave override disabled."""
+        monkeypatch.setenv(self._ENV_FLAG, flag_value)
+
+        session_override, remaining = extract_trace_overrides({"session_id": "x"})
+
+        assert session_override is None
+        assert remaining == {"session_id": "x"}
+
+    def test_override_non_string_dropped(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Non-string session_id is dropped with warning, default applies."""
+        monkeypatch.setenv(self._ENV_FLAG, "true")
+        caplog.set_level(logging.WARNING, logger="aegra_api.observability.span_enrichment")
+
+        session_override, remaining = extract_trace_overrides({"session_id": 42})
+
+        assert session_override is None
+        assert remaining == {}
+        assert any("must be string" in r.message for r in caplog.records)
+
+    def test_override_non_printable_dropped(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Non-printable session_id (e.g. newline) dropped — log injection guard (CWE-117)."""
+        monkeypatch.setenv(self._ENV_FLAG, "true")
+        caplog.set_level(logging.WARNING, logger="aegra_api.observability.span_enrichment")
+
+        session_override, _ = extract_trace_overrides({"session_id": "ok\nforged"})
+
+        assert session_override is None
+        assert any("non-printable" in r.message or "invalid" in r.message for r in caplog.records)
+
+    def test_override_too_long_dropped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """session_id longer than 256 chars dropped — defense-in-depth vs RunCreate bypass."""
+        monkeypatch.setenv(self._ENV_FLAG, "true")
+
+        session_override, _ = extract_trace_overrides({"session_id": "x" * 257})
+
+        assert session_override is None
+
+    def test_empty_metadata_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Empty extra_metadata returns (None, None) regardless of flag."""
+        monkeypatch.setenv(self._ENV_FLAG, "true")
+
+        assert extract_trace_overrides(None) == (None, None)
+        assert extract_trace_overrides({}) == (None, {})
+
+    def test_make_run_trace_context_uses_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """End-to-end: override key reaches top-level session attribute, both prefixes."""
+        monkeypatch.setenv(self._ENV_FLAG, "true")
+        ctx = make_run_trace_context(
+            "run-1",
+            "thread-default",
+            "my_graph",
+            "user-1",
+            extra_metadata={"session_id": "thread-override", "tenant": "acme"},
+        )
+
+        attrs = ctx.run(_trace_attrs.get)
+        assert attrs["langfuse.session.id"] == "thread-override"
+        assert attrs["session.id"] == "thread-override"
+        assert "langfuse.trace.metadata.session_id" not in attrs
+        assert attrs["langfuse.trace.metadata.tenant"] == "acme"
+
+    def test_make_run_trace_context_no_override_falls_back_to_thread_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Without override (flag off), session attributes default to thread_id."""
+        monkeypatch.delenv(self._ENV_FLAG, raising=False)
+        ctx = make_run_trace_context(
+            "run-1",
+            "thread-default",
+            "my_graph",
+            "user-1",
+            extra_metadata={"session_id": "ignored", "tenant": "acme"},
+        )
+
+        attrs = ctx.run(_trace_attrs.get)
+        assert attrs["langfuse.session.id"] == "thread-default"
+        assert attrs["session.id"] == "thread-default"
+        assert attrs["langfuse.trace.metadata.session_id"] == "ignored"
+
+    def test_make_run_trace_context_invalid_override_falls_back(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Invalid override (non-printable) → falls back to thread_id default."""
+        monkeypatch.setenv(self._ENV_FLAG, "true")
+        ctx = make_run_trace_context(
+            "run-1",
+            "thread-default",
+            "my_graph",
+            "user-1",
+            extra_metadata={"session_id": "bad\nvalue"},
+        )
+
+        attrs = ctx.run(_trace_attrs.get)
+        assert attrs["langfuse.session.id"] == "thread-default"
+        assert attrs["session.id"] == "thread-default"
+
+    def test_override_empty_string_dropped(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Empty string session_id is blank → dropped, default applies."""
+        monkeypatch.setenv(self._ENV_FLAG, "true")
+        caplog.set_level(logging.WARNING, logger="aegra_api.observability.span_enrichment")
+
+        session_override, _ = extract_trace_overrides({"session_id": ""})
+
+        assert session_override is None
+        assert any("blank" in r.message for r in caplog.records)
+
+    def test_override_whitespace_only_dropped(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Whitespace-only session_id is blank → dropped."""
+        monkeypatch.setenv(self._ENV_FLAG, "true")
+        caplog.set_level(logging.WARNING, logger="aegra_api.observability.span_enrichment")
+
+        session_override, _ = extract_trace_overrides({"session_id": "   \t"})
+
+        assert session_override is None
+        assert any("blank" in r.message for r in caplog.records)
+
+    def test_override_at_max_length_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """256-char session_id sits exactly on the boundary → accepted."""
+        monkeypatch.setenv(self._ENV_FLAG, "true")
+
+        session_override, _ = extract_trace_overrides({"session_id": "x" * 256})
+
+        assert session_override == "x" * 256
+
+    def test_override_unicode_emoji_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Printable Unicode (emoji) passes the validator."""
+        monkeypatch.setenv(self._ENV_FLAG, "true")
+
+        session_override, _ = extract_trace_overrides({"session_id": "🎉-session"})
+
+        assert session_override == "🎉-session"

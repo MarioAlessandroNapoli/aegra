@@ -23,6 +23,7 @@ Usage::
 
 import contextvars
 import logging
+import os
 from typing import Any
 
 from opentelemetry.context import Context
@@ -35,6 +36,11 @@ logger = logging.getLogger(__name__)
 # time, so we filter at this layer and emit an aegra-level warning
 # instead of letting drops happen invisibly inside the SDK.
 _PRIMITIVE_ATTR_TYPES: tuple[type, ...] = (str, int, float, bool)
+
+# Defense-in-depth bound for override string values. ``RunCreate`` caps
+# incoming metadata at 512 chars, but JSONB-stored or direct-DB paths
+# bypass that validator; this guard closes the replay vector.
+_OVERRIDE_VALUE_MAX_LEN = 256
 
 # Per-request context variable holding span attributes to inject.
 # None means no trace context is set; on_start() is a no-op in that case.
@@ -129,13 +135,13 @@ def merge_run_metadata(
 ) -> dict[str, str | int | float | bool]:
     """Merge user-supplied metadata with system-injected runtime keys.
 
-    Any key already present in ``system_metadata`` (currently
-    ``run_id``, ``thread_id``, ``graph_id``, and ``original_request_id``
-    on the worker path) wins on collision: the system value is kept and
-    a warning is logged so the override is visible during debugging
-    without breaking the request. ``system_metadata`` is the single
-    source of truth for "what the runtime owns" — there is no separate
-    reserved-key registry to drift out of sync with caller behavior.
+    Any key already present in ``system_metadata`` (``run_id``, ``thread_id``,
+    ``graph_id``, and ``original_request_id`` on the worker path) wins on
+    collision: the system value is kept and a warning is logged so the
+    override is visible during debugging without breaking the request.
+    ``system_metadata`` is the single source of truth for "what the runtime
+    owns" — there is no separate reserved-key registry to drift out of sync
+    with caller behavior.
 
     Non-primitive values (anything other than ``str``, ``int``, ``float``,
     ``bool``) are dropped with a warning. OTEL span attributes accept
@@ -166,6 +172,49 @@ def merge_run_metadata(
     return merged
 
 
+def metadata_overrides_enabled() -> bool:
+    """Resolve the override env flag per-call.
+
+    Re-reading on every invocation so secret rotation or test-time
+    monkeypatch is observed without restart.
+    """
+    return os.getenv("AEGRA_TRACE_METADATA_OVERRIDES", "").lower() in {"true", "1", "yes"}
+
+
+def extract_trace_overrides(
+    extra_metadata: dict[str, Any] | None,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """Pop the reserved ``session_id`` override key when the env flag is on.
+
+    Returns ``(session_override, remaining_metadata)``. Invalid values
+    (non-string, blank, non-printable, or >``_OVERRIDE_VALUE_MAX_LEN``)
+    are dropped with a warning so the caller's default attribute applies.
+    With the flag off, returns ``(None, extra_metadata)`` unchanged.
+    """
+    if not extra_metadata or not metadata_overrides_enabled():
+        return None, extra_metadata
+    remaining = dict(extra_metadata)
+    session_override = remaining.pop("session_id", None)
+    if session_override is None:
+        return None, remaining
+    if not isinstance(session_override, str):
+        logger.warning(
+            "session_id override must be string, dropping (got %s)",
+            type(session_override).__name__,
+        )
+        return None, remaining
+    if not session_override.strip():
+        logger.warning("session_id override is blank, dropping")
+        return None, remaining
+    if not session_override.isprintable() or len(session_override) > _OVERRIDE_VALUE_MAX_LEN:
+        logger.warning(
+            "session_id override invalid (non-printable or >%d chars), dropping",
+            _OVERRIDE_VALUE_MAX_LEN,
+        )
+        return None, remaining
+    return session_override, remaining
+
+
 def make_run_trace_context(
     run_id: str,
     thread_id: str,
@@ -183,18 +232,23 @@ def make_run_trace_context(
     User-supplied ``extra_metadata`` is merged with the system runtime keys
     (``run_id``, ``thread_id``, ``graph_id``).  System keys win on collision —
     see :func:`merge_run_metadata`.
+
+    When ``AEGRA_TRACE_METADATA_OVERRIDES`` is enabled, the reserved key
+    ``session_id`` in ``extra_metadata`` overrides the default top-level
+    ``langfuse.session.id`` / ``session.id`` (which defaults to ``thread_id``).
     """
+    session_override, remaining_metadata = extract_trace_overrides(extra_metadata)
     system_metadata: dict[str, str | int | float | bool] = {
         "run_id": run_id,
         "thread_id": thread_id,
         "graph_id": graph_id,
     }
-    metadata = merge_run_metadata(extra_metadata, system_metadata)
+    metadata = merge_run_metadata(remaining_metadata, system_metadata)
     ctx = contextvars.copy_context()
     ctx.run(
         set_trace_context,
         user_id=user_identity,
-        session_id=thread_id,
+        session_id=session_override or thread_id,
         trace_name=graph_id,
         metadata=metadata,
     )
