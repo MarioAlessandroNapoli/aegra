@@ -27,7 +27,7 @@ class MockProvider(ObservabilityProvider):
         self.get_callbacks_called = True
         return self.callbacks
 
-    def get_metadata(self, run_id, thread_id, user_identity=None):
+    def get_metadata(self, run_id, thread_id, user_identity=None, *, session_override=None):
         self.get_metadata_called = True
         return self.metadata
 
