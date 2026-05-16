@@ -29,6 +29,7 @@ from aegra_api.observability.base import (
     get_tracing_callbacks,
     get_tracing_metadata,
 )
+from aegra_api.observability.span_enrichment import extract_trace_overrides
 from aegra_api.services.graph_factory import (
     AccessContext,
     build_server_runtime,
@@ -746,8 +747,16 @@ def create_run_config(
     # Add metadata from all observability providers (independent of callbacks)
     cfg.setdefault("metadata", {})
     user_identity = user.identity if user else None
+    # F6 (AE-552): snapshot user-supplied session_id override before observability
+    # defaults overwrite it. PR #313 metadata path otherwise wins over the OTEL
+    # span attribute, surfacing thread_id as Langfuse trace.session_id.
+    session_override, _ = extract_trace_overrides(cfg["metadata"])
     observability_metadata = get_tracing_metadata(run_id, thread_id, user_identity)
     cfg["metadata"].update(observability_metadata)
+    if session_override:
+        cfg["metadata"]["session_id"] = session_override
+        if "langfuse_session_id" in cfg["metadata"]:
+            cfg["metadata"]["langfuse_session_id"] = session_override
 
     # Apply checkpoint parameters if provided
     if checkpoint and isinstance(checkpoint, dict):
