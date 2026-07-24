@@ -341,6 +341,7 @@ class RedisSettings(EnvBase):
     REDIS_URL: str = "redis://localhost:6379/0"
     REDIS_CHANNEL_PREFIX: str = "aegra:run:"
     REDIS_MAX_CONNECTIONS: int = 250
+    REDIS_HEALTH_CHECK_INTERVAL: float = 30.0
 
 
 class WorkerSettings(EnvBase):
