@@ -26,10 +26,14 @@ class RedisManager:
         if self._client is not None:
             return
 
+        # uvloop raises RuntimeError (not RedisError) on a dead transport: unless it is in
+        # retry_on_error the pool never recycles the broken connection and keeps handing it out.
         self._pool = aioredis.ConnectionPool.from_url(
             settings.redis.REDIS_URL,
             max_connections=settings.redis.REDIS_MAX_CONNECTIONS,
             decode_responses=True,
+            health_check_interval=settings.redis.REDIS_HEALTH_CHECK_INTERVAL,
+            retry_on_error=[RuntimeError],
         )
         self._client = aioredis.Redis(connection_pool=self._pool)
 
