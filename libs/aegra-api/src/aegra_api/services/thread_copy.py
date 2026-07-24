@@ -8,7 +8,7 @@ schema changes instead of a hardcoded column list, following the same
 ``search_path`` as the unqualified DML.
 """
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import structlog
 from psycopg import sql as pgsql
@@ -39,7 +39,9 @@ async def _table_columns(conn: "AsyncConnection", table: str) -> list[str]:
         "ORDER BY attnum",
         (table,),
     )
-    rows = await cur.fetchall()
+    # dict_row is set on the pool (core/database.py), but psycopg types the
+    # cursor rows as tuples regardless — cast rather than suppress.
+    rows = cast("list[dict[str, Any]]", await cur.fetchall())
     return [r["column_name"] for r in rows]
 
 
