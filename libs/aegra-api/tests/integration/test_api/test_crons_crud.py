@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from aegra_api.models.crons import CronResponse
 from aegra_api.services.cron_service import get_cron_service
+from aegra_api.settings import settings
 from tests.fixtures.clients import create_test_app, make_client
 from tests.fixtures.test_helpers import make_run
 
@@ -659,3 +660,34 @@ class TestTimezoneField:
         call_args = mock_cron_service.create_cron.call_args
         request_obj = call_args.args[0]
         assert request_obj.timezone is None
+
+
+class TestCronDisabledGate:
+    """CRON_ENABLED=false must stop the API, not just the scheduler.
+
+    Without the router-level gate the endpoints keep accepting and persisting
+    crons that nothing will ever fire (AE-893).
+    """
+
+    def test_create_returns_503_when_scheduler_disabled(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings.cron, "CRON_ENABLED", False)
+
+        resp = client.post("/runs/crons", json={"assistant_id": "agent", "schedule": "0 9 * * *"})
+
+        assert resp.status_code == 503
+        assert "CRON_ENABLED" in resp.json()["detail"]
+
+    def test_search_returns_503_when_scheduler_disabled(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings.cron, "CRON_ENABLED", False)
+
+        assert client.post("/runs/crons/search", json={}).status_code == 503
+
+    def test_create_reaches_handler_when_scheduler_enabled(self, client: TestClient) -> None:
+        """Guard against the gate firing on the default configuration."""
+        resp = client.post("/runs/crons", json={"assistant_id": "agent", "schedule": "0 9 * * *"})
+
+        assert resp.status_code != 503

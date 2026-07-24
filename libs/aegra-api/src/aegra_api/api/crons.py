@@ -40,8 +40,16 @@ from aegra_api.services.cron_service import (
 )
 from aegra_api.services.run_cleanup import delete_thread_by_id, schedule_background_cleanup
 from aegra_api.services.run_preparation import _prepare_run
+from aegra_api.settings import settings
 
-router = APIRouter(tags=["Crons"], dependencies=auth_dependency)
+
+def _require_cron_enabled() -> None:
+    """503 when the scheduler is off, so the API can't persist crons nobody fires."""
+    if not settings.cron.CRON_ENABLED:
+        raise HTTPException(503, "Cron scheduling is disabled on this deployment (CRON_ENABLED=false)")
+
+
+router = APIRouter(tags=["Crons"], dependencies=[*auth_dependency, Depends(_require_cron_enabled)])
 logger = structlog.getLogger(__name__)
 
 

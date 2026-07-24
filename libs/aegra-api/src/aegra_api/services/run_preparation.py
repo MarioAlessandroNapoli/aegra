@@ -15,6 +15,7 @@ from fastapi import HTTPException
 from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from aegra_api.core.auth_helpers import is_admin
 from aegra_api.core.orm import Assistant as AssistantORM
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import Thread as ThreadORM
@@ -228,10 +229,11 @@ async def _prepare_run(
     if not context:
         context = configurable.copy()
 
-    assistant_stmt = select(AssistantORM).where(
-        AssistantORM.assistant_id == resolved_assistant_id,
-        or_(AssistantORM.user_id == user.identity, AssistantORM.user_id == "system"),
-    )
+    assistant_stmt = select(AssistantORM).where(AssistantORM.assistant_id == resolved_assistant_id)
+    if not is_admin(user):
+        assistant_stmt = assistant_stmt.where(
+            or_(AssistantORM.user_id == user.identity, AssistantORM.user_id == "system")
+        )
     assistant = await session.scalar(assistant_stmt)
     if not assistant:
         raise HTTPException(404, f"Assistant '{request.assistant_id}' not found")
