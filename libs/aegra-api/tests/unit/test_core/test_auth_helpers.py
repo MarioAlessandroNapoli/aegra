@@ -44,7 +44,10 @@ class TestApplyOwnershipFilter:
         result = apply_ownership_filter(base_stmt, admin, ThreadORM)
 
         compiled = str(result.compile(compile_kwargs={"literal_binds": True}))
-        assert "user_id" not in compiled
+        # Assert on the WHERE clause only: user_id also appears in the SELECT
+        # projection, so a substring check over the whole statement is meaningless.
+        where_clause = compiled.split("WHERE", 1)[1]
+        assert "user_id" not in where_clause
 
     def test_non_admin_appends_user_filter(self):
         """Regular user: stmt gains user_id == identity WHERE clause."""
