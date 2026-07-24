@@ -40,6 +40,7 @@ from aegra_api.services.graph_factory import (
     invoke_factory,
     is_factory,
 )
+from aegra_api.utils.run_utils import strip_pinned_config_keys
 
 State = TypeVar("State")
 logger = structlog.get_logger(__name__)
@@ -715,9 +716,9 @@ def create_run_config(
 ) -> dict[str, Any]:
     """Create LangGraph configuration for a specific run with full context.
 
-    The function is *additive*: it never removes or renames anything the client
-    supplied.  We simply ensure a `configurable` dict exists and then merge a
-    few server-side keys so graph nodes can rely on them.
+    Additive for client keys, except thread_id/run_id which are forced: a
+    body-supplied configurable.thread_id would redirect execution to another
+    user's thread (the checkpointer keys on thread_id alone).
     """
     from copy import deepcopy
 
@@ -726,9 +727,9 @@ def create_run_config(
     # Ensure a configurable section exists
     cfg.setdefault("configurable", {})
 
-    # Merge server-provided fields (do NOT overwrite if client already set)
-    cfg["configurable"].setdefault("thread_id", thread_id)
-    cfg["configurable"].setdefault("run_id", run_id)
+    # Server-authoritative — overwrite, never honor a client override.
+    cfg["configurable"]["thread_id"] = thread_id
+    cfg["configurable"]["run_id"] = run_id
 
     # Ensure the root run ID is set to match so that astream_events recognizes it
     cfg.setdefault("run_id", run_id)
@@ -756,9 +757,11 @@ def create_run_config(
     )
     cfg["metadata"].update(observability_metadata)
 
-    # Apply checkpoint parameters if provided
+    # Apply checkpoint parameters if provided. Strip pinned identity keys so a
+    # client checkpoint can't redirect execution to another user's thread.
     if checkpoint and isinstance(checkpoint, dict):
-        cfg["configurable"].update({k: v for k, v in checkpoint.items() if v is not None})
+        safe = strip_pinned_config_keys(checkpoint)
+        cfg["configurable"].update({k: v for k, v in safe.items() if v is not None})
 
     # Finally inject user context via existing helper
     return inject_user_context(user, cfg)

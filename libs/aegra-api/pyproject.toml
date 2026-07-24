@@ -1,6 +1,6 @@
 [project]
 name = "aegra-api"
-version = "0.9.16+crrm.6"
+version = "0.9.16+crrm.7"
 description = "Aegra core API - Self-hosted Agent Protocol server"
 readme = "README.md"
 requires-python = ">=3.12"
