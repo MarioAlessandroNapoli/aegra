@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -843,7 +845,7 @@ class TestTransportErrorResilience:
         broker = self._make_broker()
         calls = {"n": 0}
 
-        async def fake_subscribe():  # type: ignore[no-untyped-def]
+        async def fake_subscribe() -> AsyncIterator[tuple[str, Any]]:
             calls["n"] += 1
             if calls["n"] == 1:
                 raise self._TRANSPORT_RUNTIME_ERROR
