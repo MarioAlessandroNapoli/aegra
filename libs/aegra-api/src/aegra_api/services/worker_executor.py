@@ -245,14 +245,16 @@ class WorkerExecutor(BaseExecutor):
             else:
                 # Fallback: update run status only (thread_id lookup failed)
                 await update_run_status(run_id, "error", error="Job exceeded maximum execution time")
-            await _release_lease(run_id, worker_name)
         except asyncio.CancelledError:
             logger.info("Job task cancelled", worker=worker_name, run_id=run_id)
             raise
         except Exception:
             logger.exception("Unexpected error in job execution", run_id=run_id)
         finally:
-            active_runs.pop(run_id, None)
+            # Only our own entry: a re-claim of the same run registers its
+            # task under the same key, and must stay cancellable.
+            if active_runs.get(run_id) is current_task:
+                active_runs.pop(run_id, None)
             semaphore.release()
 
     # ------------------------------------------------------------------
@@ -277,9 +279,17 @@ class WorkerExecutor(BaseExecutor):
             return await self._poll_postgres()
 
     async def _execute_with_lease(self, run_id: str, worker_name: str) -> None:
-        """Acquire lease, load job from DB, execute with heartbeat."""
+        """Acquire lease, load job from DB, execute with heartbeat.
+
+        The lease is held under a token unique to THIS claim, not the worker
+        name: when the reaper re-queues a run whose lease expired and the same
+        worker picks it up again, the first execution's heartbeat must see the
+        lease as lost and cancel itself (AE-1112). With the worker name both
+        claims matched and the run executed twice in the same process.
+        """
         lease_acquired_at = datetime.now(UTC)
-        loaded = await _acquire_and_load(run_id, worker_name)
+        claim = f"{worker_name}-{uuid.uuid4().hex[:8]}"
+        loaded = await _acquire_and_load(run_id, claim)
         if loaded is None:
             logger.debug("Lease not acquired or job missing, skipping", run_id=run_id, worker=worker_name)
             return
@@ -295,7 +305,7 @@ class WorkerExecutor(BaseExecutor):
         # lease loss, preventing double execution by a second worker.
         job_task = asyncio.create_task(execute_run(loaded.job))
         heartbeat_task = asyncio.create_task(
-            _heartbeat_loop(run_id, worker_name, job_task=job_task),
+            _heartbeat_loop(run_id, claim, job_task=job_task),
             context=contextvars.copy_context(),
         )
 
@@ -315,7 +325,7 @@ class WorkerExecutor(BaseExecutor):
             heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await asyncio.gather(job_task, heartbeat_task, return_exceptions=True)
-            await _release_lease(run_id, worker_name)
+            await _release_lease(run_id, claim)
 
             elapsed = (datetime.now(UTC) - lease_acquired_at).total_seconds()
             logger.info(
@@ -366,7 +376,7 @@ class _LoadedRun:
         self.trace = trace
 
 
-async def _acquire_and_load(run_id: str, worker_name: str) -> _LoadedRun | None:
+async def _acquire_and_load(run_id: str, claim: str) -> _LoadedRun | None:
     """Acquire lease and load job in a single DB session.
 
     Combines the lease UPDATE + job SELECT into one session. If the row
@@ -383,7 +393,7 @@ async def _acquire_and_load(run_id: str, worker_name: str) -> _LoadedRun | None:
                 RunORM.status == "pending",
                 RunORM.claimed_by.is_(None),
             )
-            .values(claimed_by=worker_name, lease_expires_at=lease_until, status="running")
+            .values(claimed_by=claim, lease_expires_at=lease_until, status="running")
         )
         if result.rowcount == 0:  # type: ignore[union-attr]
             await session.rollback()
@@ -396,11 +406,11 @@ async def _acquire_and_load(run_id: str, worker_name: str) -> _LoadedRun | None:
             logger.warning(
                 "Run not found or missing execution_params after lease, releasing claim",
                 run_id=run_id,
-                worker=worker_name,
+                claim=claim,
             )
             await session.execute(
                 update(RunORM)
-                .where(RunORM.run_id == run_id, RunORM.claimed_by == worker_name)
+                .where(RunORM.run_id == run_id, RunORM.claimed_by == claim)
                 .values(
                     claimed_by=None,
                     lease_expires_at=None,
@@ -416,13 +426,13 @@ async def _acquire_and_load(run_id: str, worker_name: str) -> _LoadedRun | None:
         return _LoadedRun(job=job, trace=trace)
 
 
-async def _release_lease(run_id: str, worker_name: str) -> None:
+async def _release_lease(run_id: str, claim: str) -> None:
     """Clear lease fields after job completion, only if this worker still owns the lease."""
     maker = _get_session_maker()
     async with maker() as session:
         await session.execute(
             update(RunORM)
-            .where(RunORM.run_id == run_id, RunORM.claimed_by == worker_name)
+            .where(RunORM.run_id == run_id, RunORM.claimed_by == claim)
             .values(claimed_by=None, lease_expires_at=None)
         )
         await session.commit()
@@ -430,7 +440,7 @@ async def _release_lease(run_id: str, worker_name: str) -> None:
 
 async def _heartbeat_loop(
     run_id: str,
-    worker_name: str,
+    claim: str,
     *,
     job_task: asyncio.Task[None] | None = None,
 ) -> None:
@@ -450,7 +460,7 @@ async def _heartbeat_loop(
             async with maker() as session:
                 result = await session.execute(
                     update(RunORM)
-                    .where(RunORM.run_id == run_id, RunORM.claimed_by == worker_name)
+                    .where(RunORM.run_id == run_id, RunORM.claimed_by == claim)
                     .values(lease_expires_at=new_expiry)
                 )
                 await session.commit()
@@ -458,15 +468,15 @@ async def _heartbeat_loop(
                 logger.warning(
                     "Lease lost, cancelling job to prevent double execution",
                     run_id=run_id,
-                    worker=worker_name,
+                    claim=claim,
                 )
                 if job_task is not None and not job_task.done():
                     _lease_loss_cancellations.add(run_id)
                     job_task.cancel()
                 return
-            logger.debug("Lease extended", run_id=run_id, worker=worker_name)
+            logger.debug("Lease extended", run_id=run_id, claim=claim)
         except Exception:
-            logger.warning("Heartbeat lease extension failed", run_id=run_id, worker=worker_name)
+            logger.warning("Heartbeat lease extension failed", run_id=run_id, claim=claim)
 
 
 async def _is_run_terminal(run_id: str) -> bool:

@@ -673,7 +673,9 @@ class TestExecuteAndRelease:
             thread_status="error",
             error="Job exceeded maximum execution time",
         )
-        mock_release.assert_awaited_once_with(run_id, "worker-0")
+        # The lease is released by _execute_with_lease itself, under its claim
+        # token (AE-1112): the timeout path no longer releases by worker name.
+        mock_release.assert_not_awaited()
         # Semaphore released even on timeout
         assert not semaphore.locked()
         # Cleaned up
