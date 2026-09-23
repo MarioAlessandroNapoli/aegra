@@ -14,6 +14,7 @@ import contextvars
 import os
 import re
 import socket
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import structlog
@@ -56,7 +57,14 @@ class WorkerExecutor(BaseExecutor):
         self._worker_tasks: list[asyncio.Task[None]] = []
         self._job_tasks: set[asyncio.Task[None]] = set()
         self._running = False
-        self._instance_id = f"{socket.gethostname()}-{os.getpid()}"
+        # hostname-pid is not unique on Cloud Run (`localhost-1` on every
+        # instance): workers of different instances would share names and the
+        # lease check (claimed_by == worker name) could not tell which one
+        # resumed a run, so the original instance kept renewing it (AE-1071).
+        # A per-process random suffix makes it unique; on Cloud Run the prefix
+        # is the revision, which tells who claimed the run.
+        host = os.environ.get("K_REVISION") or socket.gethostname()
+        self._instance_id = f"{host}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
     # ------------------------------------------------------------------
     # Submit (API side)
