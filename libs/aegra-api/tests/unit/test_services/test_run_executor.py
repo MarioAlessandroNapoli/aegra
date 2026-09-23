@@ -301,13 +301,12 @@ class TestLeaseLossCancellation:
 
             from aegra_api.services.run_executor import _lease_loss_cancellations, execute_run
 
-            # Simulate heartbeat marking this as a lease-loss cancel
-            _lease_loss_cancellations.add("run-1")
-            try:
-                with pytest.raises(asyncio.CancelledError):
-                    await execute_run(_make_job())
-            finally:
-                _lease_loss_cancellations.discard("run-1")
+            # Simulate heartbeat marking this execution's task as a lease-loss cancel
+            task = asyncio.create_task(execute_run(_make_job()))
+            _lease_loss_cancellations.add(task)
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert task not in _lease_loss_cancellations
 
         # finalize_run must NOT be called — the new worker owns this run
         mock_finalize.assert_not_awaited()

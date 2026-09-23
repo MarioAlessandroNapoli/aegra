@@ -7,6 +7,7 @@ Single source of truth for executing a graph run. Both LocalExecutor
 """
 
 import asyncio
+import weakref
 from typing import Any
 
 import structlog
@@ -28,15 +29,16 @@ logger = structlog.getLogger(__name__)
 
 _DEFAULT_STREAM_MODES = ["values"]
 
-# Run IDs whose cancellation was triggered by lease loss (not user action).
-# When a heartbeat detects lease loss, it adds the run_id here before
-# cancelling the job task. execute_run's CancelledError handler checks
-# this set to skip finalize_run and SSE signaling — the reaper has already
-# re-enqueued the run and another worker will execute it. Without this,
-# the old worker would write status="interrupted" and send an SSE end event,
-# prematurely closing client streams and potentially overwriting the new
-# worker's status.
-_lease_loss_cancellations: set[str] = set()
+# Job tasks whose cancellation was triggered by lease loss (not user action).
+# When a heartbeat detects lease loss, it adds the job task here before
+# cancelling it. execute_run's CancelledError handler checks this set to skip
+# finalize_run and SSE signaling — the reaper has already re-enqueued the run
+# and another execution owns it. Without this, the old execution would write
+# status="interrupted" and send an SSE end event, prematurely closing client
+# streams and potentially overwriting the new execution's status. Keyed by
+# task, not run_id: when the same process re-claims the run, the flag must
+# reach only the execution that lost the lease (AE-1112).
+_lease_loss_cancellations: weakref.WeakSet[asyncio.Task[None]] = weakref.WeakSet()
 
 
 async def execute_run(job: RunJob) -> None:
@@ -47,6 +49,7 @@ async def execute_run(job: RunJob) -> None:
     """
     run_id = job.identity.run_id
     thread_id = job.identity.thread_id
+    this_task = asyncio.current_task()
     is_lease_loss = False
 
     try:
@@ -72,7 +75,7 @@ async def execute_run(job: RunJob) -> None:
             )
 
     except asyncio.CancelledError:
-        if run_id in _lease_loss_cancellations:
+        if this_task in _lease_loss_cancellations:
             # Lease was lost — the reaper re-enqueued this run for another
             # worker.  Do NOT finalize, signal done, or clean up the broker.
             # The new worker owns the run now.
@@ -91,8 +94,14 @@ async def execute_run(job: RunJob) -> None:
         status = "interrupted" if final_output.has_interrupt else "success"
         await _best_effort_signal(_signal_end_event, run_id, status)
     finally:
-        _lease_loss_cancellations.discard(run_id)
-        active_runs.pop(run_id, None)
+        if this_task is not None:
+            _lease_loss_cancellations.discard(this_task)
+        # Only the entry this execution owns: LocalExecutor registers this very
+        # task, WorkerExecutor registers its outer task and removes it itself.
+        # A re-claim of the same run by the same process registers a new entry
+        # under the same key, and it must stay cancellable (AE-1112).
+        if active_runs.get(run_id) is this_task:
+            active_runs.pop(run_id, None)
         if not is_lease_loss:
             await streaming_service.cleanup_run(run_id)
             await _signal_run_done(run_id)

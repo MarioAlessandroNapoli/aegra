@@ -713,13 +713,13 @@ class TestExecuteWithLease:
             patch(f"{MODULE}._release_lease", new_callable=AsyncMock),
         ):
             # Run _execute_with_lease in a task and cancel it (simulating wait_for timeout).
-            # The CancelledError is caught internally by _execute_with_lease's
-            # except block, so the task completes normally — but the inner
-            # job_task must still have been cancelled.
+            # The inner job_task must be cancelled, and the cancellation must
+            # propagate so wait_for can raise TimeoutError (AE-1112).
             task = asyncio.create_task(executor._execute_with_lease(run_id, "worker-0"))
             await asyncio.sleep(0.05)  # Let it start
             task.cancel()
-            await task  # Completes normally (CancelledError is handled internally)
+            with pytest.raises(asyncio.CancelledError):
+                await task
 
         assert job_task_was_cancelled, "job_task must be cancelled when _execute_with_lease is cancelled"
 

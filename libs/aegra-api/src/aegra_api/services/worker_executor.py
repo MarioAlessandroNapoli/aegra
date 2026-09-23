@@ -313,6 +313,15 @@ class WorkerExecutor(BaseExecutor):
             await job_task
         except asyncio.CancelledError:
             logger.info("Worker job cancelled", worker=worker_name, run_id=run_id)
+            # The job task was cancelled (lease loss, user cancel): its own
+            # handler finalized it, this coroutine goes on to release. If THIS
+            # coroutine is the one being cancelled (wait_for timeout, shutdown)
+            # the cancellation must propagate after the cleanup below: swallowed,
+            # wait_for returns normally and the timeout branch of
+            # _execute_and_release never records the error.
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
         except Exception:
             logger.exception("Worker job failed", worker=worker_name, run_id=run_id)
         finally:
@@ -471,7 +480,7 @@ async def _heartbeat_loop(
                     claim=claim,
                 )
                 if job_task is not None and not job_task.done():
-                    _lease_loss_cancellations.add(run_id)
+                    _lease_loss_cancellations.add(job_task)
                     job_task.cancel()
                 return
             logger.debug("Lease extended", run_id=run_id, claim=claim)
