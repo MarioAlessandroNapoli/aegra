@@ -58,10 +58,16 @@ class LeaseReaper:
                 break
             except Exception:
                 logger.exception("Error in lease reaper")
+            # A step of its own: a failing lane check must never stop crash recovery.
+            try:
+                await self._check_lanes()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Error in lane check")
 
     async def _reap(self) -> None:
         """Find crashed workers and stuck pending runs, recover them."""
-        await self._check_lanes()
         crashed, stuck_pending = await self._find_recoverable()
 
         if not crashed and not stuck_pending:

@@ -8,7 +8,7 @@ the reaper reconciles the demand list with the runs table and raises the stall a
 from datetime import UTC, datetime
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aegra_api.core.orm import Run as RunORM
@@ -27,10 +27,12 @@ def _lane_column():  # noqa: ANN202 — SQLAlchemy expression
 
 async def pending_by_lane(session: AsyncSession) -> dict[str, dict[str, float | int | None]]:
     """Per lane: unclaimed pending runs and the age in seconds of the oldest one."""
+    # GROUP BY sull'alias: ripetere l'espressione JSON la rilega con parametri nuovi
+    # ($4, $5) e Postgres non la riconosce come la stessa colonna del SELECT.
     rows = await session.execute(
-        select(_lane_column(), func.count(), func.min(RunORM.created_at))
+        select(_lane_column().label("lane"), func.count(), func.min(RunORM.created_at))
         .where(RunORM.status == "pending", RunORM.claimed_by.is_(None))
-        .group_by(_lane_column())
+        .group_by(text("lane"))
     )
     now = datetime.now(UTC)
     found = {lane: (n, oldest) for lane, n, oldest in rows.all()}
