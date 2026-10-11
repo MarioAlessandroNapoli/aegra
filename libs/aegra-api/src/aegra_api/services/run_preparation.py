@@ -23,8 +23,10 @@ from aegra_api.core.orm import _get_session_maker
 from aegra_api.models import Run, RunCreate, User
 from aegra_api.models.run_job import RunBehavior, RunExecution, RunIdentity, RunJob
 from aegra_api.services.executor import executor
+from aegra_api.services.lanes import MissingLaneError, lane_of
 from aegra_api.services.langgraph_service import get_langgraph_service
 from aegra_api.services.run_status import set_thread_status
+from aegra_api.settings import settings
 from aegra_api.utils.assistants import resolve_assistant_id
 from aegra_api.utils.run_utils import _merge_jsonb
 
@@ -228,6 +230,13 @@ async def _prepare_run(
 
     if not context:
         context = configurable.copy()
+
+    # Before anything is persisted: a run without a lane would sit in no queue.
+    if settings.redis.REDIS_BROKER_ENABLED:
+        try:
+            lane_of(request.metadata)
+        except MissingLaneError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
 
     assistant_stmt = select(AssistantORM).where(AssistantORM.assistant_id == resolved_assistant_id)
     if not is_admin(user):

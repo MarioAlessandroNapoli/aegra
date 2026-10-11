@@ -17,6 +17,7 @@ from sqlalchemy import select, update
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import _get_session_maker
 from aegra_api.core.redis_manager import redis_manager
+from aegra_api.services.lanes import lane_of, queue_key
 from aegra_api.settings import settings
 
 logger = structlog.getLogger(__name__)
@@ -136,13 +137,25 @@ class LeaseReaper:
             return reset_ids
 
     @staticmethod
-    async def _reenqueue(run_ids: list[str]) -> None:
-        queue_key = settings.worker.WORKER_QUEUE_KEY
+    async def _lanes(run_ids: list[str]) -> dict[str, str]:
+        """Each run goes back to its own lane, not to the queue of the reaping instance."""
+        maker = _get_session_maker()
+        async with maker() as session:
+            rows = await session.execute(
+                select(RunORM.run_id, RunORM.execution_params).where(RunORM.run_id.in_(run_ids))
+            )
+            return {run_id: lane_of((params or {}).get("run_metadata")) for run_id, params in rows.all()}
+
+    @classmethod
+    async def _reenqueue(cls, run_ids: list[str]) -> None:
+        if not run_ids:
+            return
+        lanes = await cls._lanes(run_ids)
         try:
             client = redis_manager.get_client()
             for run_id in run_ids:
-                await client.rpush(queue_key, run_id)  # type: ignore[arg-type]
-                logger.info("Re-enqueued recovered run", run_id=run_id)
+                await client.rpush(queue_key(lanes[run_id]), run_id)  # type: ignore[arg-type]
+                logger.info("Re-enqueued recovered run", run_id=run_id, lane=lanes[run_id])
         except RedisError:
             logger.warning(
                 "Redis unavailable during re-enqueue; workers will pick up via Postgres poll",

@@ -92,10 +92,13 @@ class TestReenqueue:
         ):
             mock_settings.worker.WORKER_QUEUE_KEY = "aegra:jobs"
             mock_rm.get_client.return_value = mock_client
-
-            await LeaseReaper._reenqueue(["run-1", "run-2"])
+            lanes = AsyncMock(return_value={"run-1": "chat", "run-2": "bg"})
+            with patch.object(LeaseReaper, "_lanes", lanes):
+                await LeaseReaper._reenqueue(["run-1", "run-2"])
 
         assert mock_client.rpush.await_count == 2
+        mock_client.rpush.assert_any_await("aegra:jobs", "run-1")
+        mock_client.rpush.assert_any_await("aegra:jobs:bg", "run-2")
 
     @pytest.mark.asyncio
     async def test_logs_warning_when_redis_unavailable(self) -> None:
@@ -107,7 +110,8 @@ class TestReenqueue:
             mock_rm.get_client.side_effect = RedisError("connection refused")
 
             # Should not raise
-            await LeaseReaper._reenqueue(["run-1"])
+            with patch.object(LeaseReaper, "_lanes", AsyncMock(return_value={"run-1": "chat"})):
+                await LeaseReaper._reenqueue(["run-1"])
 
     @pytest.mark.asyncio
     async def test_noop_when_empty_list(self) -> None:

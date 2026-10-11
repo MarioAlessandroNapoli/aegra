@@ -356,6 +356,8 @@ class WorkerSettings(EnvBase):
     WORKER_COUNT: int = 3
     N_JOBS_PER_WORKER: int = 10
     WORKER_QUEUE_KEY: str = "aegra:jobs"
+    # Lanes consumed by this instance, in BLPOP priority order (services/lanes.py).
+    WORKER_LANES: list[str] = ["chat", "bg"]
     WORKER_DRAIN_TIMEOUT: float = 30.0
     BG_JOB_TIMEOUT_SECS: int = 3600
     BG_JOB_MAX_RETRIES: int = 3
@@ -370,6 +372,13 @@ class WorkerSettings(EnvBase):
     REAPER_INTERVAL_SECONDS: int = 15
     STUCK_PENDING_THRESHOLD_SECONDS: int = 120
     POSTGRES_POLL_INTERVAL_SECONDS: int = 5
+
+    @model_validator(mode="after")
+    def _validate_lanes(self) -> "WorkerSettings":
+        unknown = set(self.WORKER_LANES) - {"chat", "bg"}
+        if not self.WORKER_LANES or unknown:
+            raise ValueError(f"WORKER_LANES must be a non-empty subset of chat, bg; got {self.WORKER_LANES}")
+        return self
 
     @model_validator(mode="after")
     def _validate_lease_timing(self) -> "WorkerSettings":

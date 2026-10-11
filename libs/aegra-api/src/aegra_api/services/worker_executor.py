@@ -21,7 +21,7 @@ import structlog
 from asgi_correlation_id import correlation_id
 from redis import RedisError
 from redis import TimeoutError as RedisTimeoutError
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
 from aegra_api.core.active_runs import active_runs
 from aegra_api.core.orm import Run as RunORM
@@ -34,6 +34,7 @@ from aegra_api.observability.span_enrichment import (
     set_trace_context,
 )
 from aegra_api.services.base_executor import BaseExecutor
+from aegra_api.services.lanes import LANE_KEY, consumed_lanes, lane_of, queue_key
 from aegra_api.services.run_executor import _lease_loss_cancellations, execute_run
 from aegra_api.services.run_status import finalize_run, update_run_status
 from aegra_api.settings import settings
@@ -71,12 +72,13 @@ class WorkerExecutor(BaseExecutor):
     # ------------------------------------------------------------------
 
     async def submit(self, job: RunJob) -> None:
+        queue = queue_key(lane_of(job.run_metadata))
         client = redis_manager.get_client()
-        await client.rpush(settings.worker.WORKER_QUEUE_KEY, job.identity.run_id)  # type: ignore[arg-type]
+        await client.rpush(queue, job.identity.run_id)  # type: ignore[arg-type]
         logger.info(
             "Enqueued run_id to job queue",
             run_id=job.identity.run_id,
-            queue=settings.worker.WORKER_QUEUE_KEY,
+            queue=queue,
         )
 
     # ------------------------------------------------------------------
@@ -265,7 +267,8 @@ class WorkerExecutor(BaseExecutor):
         """BLPOP with 5s timeout. Falls back to Postgres polling if Redis is down."""
         try:
             client = redis_manager.get_client()
-            result = await client.blpop(settings.worker.WORKER_QUEUE_KEY, timeout=5)  # type: ignore[arg-type]
+            keys = [queue_key(lane) for lane in consumed_lanes()]
+            result = await client.blpop(keys, timeout=5)  # type: ignore[arg-type]
             if result is None:
                 return None
             return result[1]
@@ -351,7 +354,13 @@ class WorkerExecutor(BaseExecutor):
         async with maker() as session:
             run_id = await session.scalar(
                 select(RunORM.run_id)
-                .where(RunORM.status == "pending", RunORM.claimed_by.is_(None))
+                .where(
+                    RunORM.status == "pending",
+                    RunORM.claimed_by.is_(None),
+                    func.jsonb_extract_path_text(RunORM.execution_params, "run_metadata", LANE_KEY).in_(
+                        consumed_lanes()
+                    ),
+                )
                 .order_by(RunORM.created_at.asc())
                 .limit(1)
             )

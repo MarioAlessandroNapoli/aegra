@@ -10,6 +10,7 @@ from redis import TimeoutError as RedisTimeoutError
 from aegra_api.core.active_runs import active_runs
 from aegra_api.models.auth import User
 from aegra_api.models.run_job import RunBehavior, RunExecution, RunIdentity, RunJob
+from aegra_api.services.lanes import MissingLaneError
 from aegra_api.services.worker_executor import (
     WorkerExecutor,
     _acquire_and_load,
@@ -503,19 +504,20 @@ class TestWorkerExecutorSubmit:
         mock_client = AsyncMock()
         mock_client.rpush = AsyncMock()
 
-        job = _make_run_job()
+        job = _make_run_job().model_copy(update={"run_metadata": {"lane": "bg"}})
 
-        with (
-            patch(f"{MODULE}.redis_manager") as mock_redis,
-            patch(f"{MODULE}.settings") as mock_settings,
-        ):
+        with patch(f"{MODULE}.redis_manager") as mock_redis:
             mock_redis.get_client.return_value = mock_client
-            mock_settings.worker.WORKER_QUEUE_KEY = "aegra:jobs"
 
             executor = WorkerExecutor()
             await executor.submit(job)
 
-        mock_client.rpush.assert_awaited_once_with("aegra:jobs", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        mock_client.rpush.assert_awaited_once_with("aegra:jobs:bg", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+
+    @pytest.mark.asyncio
+    async def test_rejects_run_without_lane(self) -> None:
+        with pytest.raises(MissingLaneError):
+            await WorkerExecutor().submit(_make_run_job())
 
 
 # ------------------------------------------------------------------
