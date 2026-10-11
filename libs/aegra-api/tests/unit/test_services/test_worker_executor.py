@@ -504,7 +504,7 @@ class TestWorkerExecutorSubmit:
         mock_client = AsyncMock()
         mock_client.rpush = AsyncMock()
 
-        job = _make_run_job().model_copy(update={"run_metadata": {"lane": "bg"}})
+        job = _make_run_job().model_copy(update={"run_metadata": {"lane": "chat"}})
 
         with patch(f"{MODULE}.redis_manager") as mock_redis:
             mock_redis.get_client.return_value = mock_client
@@ -512,7 +512,31 @@ class TestWorkerExecutorSubmit:
             executor = WorkerExecutor()
             await executor.submit(job)
 
-        mock_client.rpush.assert_awaited_once_with("aegra:jobs:bg", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        mock_client.rpush.assert_awaited_once_with("aegra:jobs", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+
+    @pytest.mark.asyncio
+    async def test_bg_run_goes_to_queue_and_demand_together(self) -> None:
+        pipe = MagicMock()
+        pipe.execute = AsyncMock()
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=pipe)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        mock_client = MagicMock()
+        mock_client.pipeline.return_value = ctx
+
+        job = _make_run_job().model_copy(update={"run_metadata": {"lane": "bg"}})
+
+        with patch(f"{MODULE}.redis_manager") as mock_redis:
+            mock_redis.get_client.return_value = mock_client
+            await WorkerExecutor().submit(job)
+
+        mock_client.pipeline.assert_called_once_with(transaction=True)
+        run_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        assert [c.args for c in pipe.rpush.call_args_list] == [
+            ("aegra:jobs:bg", run_id),
+            ("aegra:jobs:bg:demand", run_id),
+        ]
+        pipe.execute.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_rejects_run_without_lane(self) -> None:
@@ -614,6 +638,12 @@ class TestWorkerExecutorStop:
 
 
 class TestExecuteAndRelease:
+    @pytest.fixture(autouse=True)
+    def _no_demand_release(self):  # noqa: ANN202
+        """Releasing the bg demand entry talks to Redis; these tests cover the slot lifecycle."""
+        with patch(f"{MODULE}._release_demand", new_callable=AsyncMock):
+            yield
+
     @pytest.mark.asyncio
     async def test_registers_in_active_runs_and_cleans_up(self) -> None:
         run_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"

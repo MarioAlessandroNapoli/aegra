@@ -34,7 +34,7 @@ from aegra_api.observability.span_enrichment import (
     set_trace_context,
 )
 from aegra_api.services.base_executor import BaseExecutor
-from aegra_api.services.lanes import LANE_KEY, consumed_lanes, lane_of, queue_key
+from aegra_api.services.lanes import LANE_KEY, consumed_lanes, demand_key, lane_of, queue_key
 from aegra_api.services.run_executor import _lease_loss_cancellations, execute_run
 from aegra_api.services.run_status import finalize_run, update_run_status
 from aegra_api.settings import settings
@@ -72,9 +72,18 @@ class WorkerExecutor(BaseExecutor):
     # ------------------------------------------------------------------
 
     async def submit(self, job: RunJob) -> None:
-        queue = queue_key(lane_of(job.run_metadata))
+        lane = lane_of(job.run_metadata)
+        queue = queue_key(lane)
         client = redis_manager.get_client()
-        await client.rpush(queue, job.identity.run_id)  # type: ignore[arg-type]
+        if lane == "bg":
+            # Queue and demand together: the bg pool autoscaler must never see a
+            # queued run it does not count (services/lane_health.py).
+            async with client.pipeline(transaction=True) as pipe:
+                pipe.rpush(queue, job.identity.run_id)  # type: ignore[arg-type]
+                pipe.rpush(demand_key(), job.identity.run_id)  # type: ignore[arg-type]
+                await pipe.execute()
+        else:
+            await client.rpush(queue, job.identity.run_id)  # type: ignore[arg-type]
         logger.info(
             "Enqueued run_id to job queue",
             run_id=job.identity.run_id,
@@ -257,6 +266,8 @@ class WorkerExecutor(BaseExecutor):
             # task under the same key, and must stay cancellable.
             if active_runs.get(run_id) is current_task:
                 active_runs.pop(run_id, None)
+            if "bg" in consumed_lanes():
+                await _release_demand(run_id)
             semaphore.release()
 
     # ------------------------------------------------------------------
@@ -370,6 +381,15 @@ class WorkerExecutor(BaseExecutor):
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+
+
+async def _release_demand(run_id: str) -> None:
+    """The run no longer holds a bg slot. With Redis down the workers already run on
+    the Postgres poll; the reaper's reconcile drops the stale entry once Redis is back."""
+    try:
+        await redis_manager.get_client().lrem(demand_key(), 0, run_id)  # type: ignore[misc]
+    except RedisError as exc:
+        logger.warning("bg demand release deferred to the reaper reconcile", run_id=run_id, error=str(exc))
 
 
 async def _get_thread_id_for_run(run_id: str) -> str | None:

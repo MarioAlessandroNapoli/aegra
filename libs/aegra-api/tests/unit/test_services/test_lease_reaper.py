@@ -130,6 +130,12 @@ class TestReenqueue:
 
 
 class TestReap:
+    @pytest.fixture(autouse=True)
+    def _no_lane_check(self):  # noqa: ANN202
+        """_reap first checks the lanes against the DB and Redis; these tests cover recovery."""
+        with patch.object(LeaseReaper, "_check_lanes", new_callable=AsyncMock):
+            yield
+
     @pytest.mark.asyncio
     async def test_crashed_runs_reset_before_retry_check(self) -> None:
         """Reset claims ownership atomically, then retry check runs on claimed set only."""

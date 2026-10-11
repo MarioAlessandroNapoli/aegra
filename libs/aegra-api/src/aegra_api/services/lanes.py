@@ -36,6 +36,14 @@ def queue_key(lane: str) -> str:
     raise MissingLaneError(f"unknown lane {lane!r}, expected one of {LANES}")
 
 
+def demand_key() -> str:
+    """bg runs queued or in flight: the one list the bg worker pool autoscaler reads.
+
+    Two lists (queue + in-flight) would not do: the autoscaler takes the max of its
+    triggers, not the sum, so a full instance with runs waiting would not scale up."""
+    return f"{queue_key('bg')}:demand"
+
+
 def consumed_lanes() -> list[str]:
     """Lanes this instance consumes, in priority order."""
     return list(settings.worker.WORKER_LANES)

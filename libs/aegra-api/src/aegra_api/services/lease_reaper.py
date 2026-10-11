@@ -17,6 +17,7 @@ from sqlalchemy import select, update
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import _get_session_maker
 from aegra_api.core.redis_manager import redis_manager
+from aegra_api.services.lane_health import pending_by_lane, reconcile_demand, stalled
 from aegra_api.services.lanes import lane_of, queue_key
 from aegra_api.settings import settings
 
@@ -60,6 +61,7 @@ class LeaseReaper:
 
     async def _reap(self) -> None:
         """Find crashed workers and stuck pending runs, recover them."""
+        await self._check_lanes()
         crashed, stuck_pending = await self._find_recoverable()
 
         if not crashed and not stuck_pending:
@@ -86,6 +88,27 @@ class LeaseReaper:
             crashed_recovered=len(crashed),
             stuck_reenqueued=len(stuck_pending),
         )
+
+    @staticmethod
+    async def _check_lanes() -> None:
+        """Reconcile the bg demand list and raise the stall alarm (services/lane_health.py)."""
+        maker = _get_session_maker()
+        async with maker() as session:
+            lanes = await pending_by_lane(session)
+            try:
+                added, removed = await reconcile_demand(session)
+                if added or removed:
+                    logger.info("bg demand reconciled", added=added, removed=removed)
+            except RedisError as exc:
+                logger.warning("bg demand reconcile skipped, Redis unavailable", error=str(exc))
+        for lane in stalled(lanes):
+            logger.error(
+                "Lane stalled: a pending run has waited past the alarm with no worker claiming it",
+                lane=lane,
+                oldest_pending_s=lanes[lane]["oldest_pending_s"],
+                pending=lanes[lane]["pending"],
+                alarm_s=settings.worker.LANE_STALL_ALARM_SECONDS,
+            )
 
     @staticmethod
     async def _find_recoverable() -> tuple[list[str], list[str]]:

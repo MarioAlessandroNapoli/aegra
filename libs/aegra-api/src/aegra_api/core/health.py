@@ -8,7 +8,11 @@ from sqlalchemy import text
 
 from aegra_api import __version__
 from aegra_api.core.database import db_manager
+from aegra_api.core.orm import _get_session_maker
+from aegra_api.core.redis_manager import redis_manager
 from aegra_api.models.errors import UNAVAILABLE
+from aegra_api.services.lane_health import pending_by_lane, stalled
+from aegra_api.services.lanes import demand_key
 from aegra_api.settings import settings
 
 router = APIRouter(tags=["Health"])
@@ -148,3 +152,26 @@ async def liveness_check(_request: Request) -> dict[str, str]:
     backend connectivity.
     """
     return {"status": "alive"}
+
+
+class QueuesResponse(BaseModel):
+    """Job lanes: unclaimed pending runs, the oldest one's age, and the stall alarm."""
+
+    lanes: dict = Field(..., description="Per lane: pending (unclaimed) and oldest_pending_s.")
+    bg_demand: int | None = Field(..., description="Length of the bg demand list the bg pool scales on.")
+    stalled: list[str] = Field(..., description="Lanes whose oldest pending run is older than alarm_s.")
+    alarm_s: int = Field(..., description="LANE_STALL_ALARM_SECONDS.")
+
+
+@router.get("/queues", response_model=QueuesResponse)
+async def queues(_request: Request) -> QueuesResponse:
+    """Lane health for monitoring (athena-backend system-health). A stalled lane means
+    no worker consumes it: for bg, the worker pool or its autoscaler is down."""
+    async with _get_session_maker()() as session:
+        lanes = await pending_by_lane(session)
+    return QueuesResponse(
+        lanes=lanes,
+        bg_demand=await redis_manager.get_client().llen(demand_key()),  # type: ignore[misc]
+        stalled=stalled(lanes),
+        alarm_s=settings.worker.LANE_STALL_ALARM_SECONDS,
+    )

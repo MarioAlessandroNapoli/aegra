@@ -372,6 +372,10 @@ class WorkerSettings(EnvBase):
     REAPER_INTERVAL_SECONDS: int = 15
     STUCK_PENDING_THRESHOLD_SECONDS: int = 120
     POSTGRES_POLL_INTERVAL_SECONDS: int = 5
+    # A pending run no worker has claimed for this long means its lane has no consumer
+    # (bg worker pool down, autoscaler stopped): the reaper logs it at ERROR and /queues
+    # reports it, so a stalled lane is loud instead of silent.
+    LANE_STALL_ALARM_SECONDS: int = 600
 
     @model_validator(mode="after")
     def _validate_lanes(self) -> "WorkerSettings":
