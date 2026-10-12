@@ -145,7 +145,7 @@ In dev mode (`REDIS_BROKER_ENABLED=false`), runs execute as in-process asyncio t
 | `HEARTBEAT_INTERVAL_SECONDS` | `10` | How often workers extend their lease |
 | `REAPER_INTERVAL_SECONDS` | `15` | How often the reaper scans for expired leases |
 | `POSTGRES_POLL_INTERVAL_SECONDS` | `5` | Fallback poll interval when Redis is unavailable |
-| `WORKER_DRAIN_TIMEOUT` | `30.0` | Graceful shutdown wait time (seconds) |
+| `WORKER_DRAIN_TIMEOUT` | `30.0` | Shutdown wait (seconds) for in-flight runs to be handed back to the queue; they resume from their checkpoint on another instance |
 
 Total capacity per instance = `WORKER_COUNT` x `N_JOBS_PER_WORKER` (default: 30 concurrent runs).
 

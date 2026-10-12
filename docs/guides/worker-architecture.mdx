@@ -287,7 +287,7 @@ All worker settings are configured via environment variables. See the [environme
 | `HEARTBEAT_INTERVAL_SECONDS` | `10` | Lease extension frequency |
 | `REAPER_INTERVAL_SECONDS` | `15` | Expired lease scan frequency |
 | `POSTGRES_POLL_INTERVAL_SECONDS` | `5` | Fallback poll interval when Redis is unavailable |
-| `WORKER_DRAIN_TIMEOUT` | `30.0` | Graceful shutdown wait time (seconds) |
+| `WORKER_DRAIN_TIMEOUT` | `30.0` | Shutdown wait (seconds) for in-flight runs to be handed back to the queue; they resume from their checkpoint on another instance |
 
 <Note>
   When Redis is unavailable, workers fall back to polling PostgreSQL for pending runs at `POSTGRES_POLL_INTERVAL_SECONDS` intervals. This keeps the system functional during Redis outages, though with higher latency.

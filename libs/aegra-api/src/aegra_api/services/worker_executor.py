@@ -58,6 +58,10 @@ class WorkerExecutor(BaseExecutor):
         self._worker_tasks: list[asyncio.Task[None]] = []
         self._job_tasks: set[asyncio.Task[None]] = set()
         self._running = False
+        # Graph executions in flight, flagged as lease loss by stop() before any cancel.
+        self._graph_tasks: set[asyncio.Task[None]] = set()
+        # Runs handed back to the queue by stop(): they keep their bg demand entry.
+        self._requeued_on_stop: set[str] = set()
         # hostname-pid is not unique on Cloud Run (`localhost-1` on every
         # instance): workers of different instances would share names and the
         # lease check (claimed_by == worker name) could not tell which one
@@ -143,23 +147,31 @@ class WorkerExecutor(BaseExecutor):
         )
 
     async def stop(self) -> None:
+        """Hand in-flight runs back to the queue instead of draining them (AE-1351).
+
+        Cloud Run kills the instance 10 s after SIGTERM, far less than a run lasts:
+        each run goes back pending in its lane at once and resumes from its
+        checkpoint elsewhere, without spending a retry or closing as interrupted.
+        """
         self._running = False
-        drain_timeout = settings.worker.WORKER_DRAIN_TIMEOUT
 
-        # Wait for in-flight job tasks to finish
-        if self._job_tasks:
-            logger.info("Draining in-flight jobs", count=len(self._job_tasks))
-            _, pending = await asyncio.wait(self._job_tasks, timeout=drain_timeout)
-            for task in pending:
-                task.cancel()
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
-
-        # Cancel worker loops
+        # Worker loops first: no BLPOP may hand out a run after this point.
         for task in self._worker_tasks:
             task.cancel()
         if self._worker_tasks:
             await asyncio.gather(*self._worker_tasks, return_exceptions=True)
+
+        if self._job_tasks:
+            logger.info("Requeueing in-flight jobs on shutdown", count=len(self._job_tasks))
+            # Cancelling a job task cancels the graph task it awaits at once: the flag
+            # must be set first, or execute_run closes the run as interrupted.
+            for graph_task in self._graph_tasks:
+                _lease_loss_cancellations.add(graph_task)
+            for task in self._job_tasks:
+                task.cancel()
+            _, pending = await asyncio.wait(self._job_tasks, timeout=settings.worker.WORKER_DRAIN_TIMEOUT)
+            if pending:
+                logger.error("In-flight jobs not requeued before the drain timeout", count=len(pending))
 
         self._worker_tasks.clear()
         self._job_tasks.clear()
@@ -266,7 +278,9 @@ class WorkerExecutor(BaseExecutor):
             # task under the same key, and must stay cancellable.
             if active_runs.get(run_id) is current_task:
                 active_runs.pop(run_id, None)
-            if "bg" in consumed_lanes():
+            if run_id in self._requeued_on_stop:
+                self._requeued_on_stop.discard(run_id)
+            elif "bg" in consumed_lanes():
                 await _release_demand(run_id)
             semaphore.release()
 
@@ -303,7 +317,12 @@ class WorkerExecutor(BaseExecutor):
         """
         lease_acquired_at = datetime.now(UTC)
         claim = f"{worker_name}-{uuid.uuid4().hex[:8]}"
-        loaded = await _acquire_and_load(run_id, claim)
+        try:
+            loaded = await _acquire_and_load(run_id, claim)
+        except asyncio.CancelledError:
+            if not self._running and await _requeue_claim(run_id, claim):
+                self._requeued_on_stop.add(run_id)
+            raise
         if loaded is None:
             logger.debug("Lease not acquired or job missing, skipping", run_id=run_id, worker=worker_name)
             return
@@ -318,6 +337,8 @@ class WorkerExecutor(BaseExecutor):
         # Wrap execute_run in a task so the heartbeat can cancel it on
         # lease loss, preventing double execution by a second worker.
         job_task = asyncio.create_task(execute_run(loaded.job))
+        self._graph_tasks.add(job_task)
+        job_task.add_done_callback(self._graph_tasks.discard)
         heartbeat_task = asyncio.create_task(
             _heartbeat_loop(run_id, claim, job_task=job_task),
             context=contextvars.copy_context(),
@@ -348,7 +369,10 @@ class WorkerExecutor(BaseExecutor):
             heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await asyncio.gather(job_task, heartbeat_task, return_exceptions=True)
-            await _release_lease(run_id, claim)
+            if not self._running and job_task.cancelled() and await _requeue_claim(run_id, claim):
+                self._requeued_on_stop.add(run_id)
+            else:
+                await _release_lease(run_id, claim)
 
             elapsed = (datetime.now(UTC) - lease_acquired_at).total_seconds()
             logger.info(
@@ -474,6 +498,29 @@ async def _release_lease(run_id: str, claim: str) -> None:
             .values(claimed_by=None, lease_expires_at=None)
         )
         await session.commit()
+
+
+async def _requeue_claim(run_id: str, claim: str) -> bool:
+    """Put a run this claim still holds back pending in its lane, without touching
+    its retry count: shutdown is not a worker failure (AE-1351)."""
+    maker = _get_session_maker()
+    async with maker() as session:
+        params = await session.scalar(
+            update(RunORM)
+            .where(RunORM.run_id == run_id, RunORM.claimed_by == claim, RunORM.status == "running")
+            .values(status="pending", claimed_by=None, lease_expires_at=None)
+            .returning(RunORM.execution_params)
+        )
+        await session.commit()
+    if params is None:
+        return False
+    lane = lane_of(params.get("run_metadata"))
+    try:
+        await redis_manager.get_client().rpush(queue_key(lane), run_id)  # type: ignore[arg-type]
+    except RedisError as exc:
+        logger.warning("Requeue push failed, the reaper re-enqueues the pending run", run_id=run_id, error=str(exc))
+    logger.info("Requeued in-flight run on shutdown", run_id=run_id, lane=lane)
+    return True
 
 
 async def _heartbeat_loop(
