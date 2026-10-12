@@ -654,9 +654,12 @@ class TestExecuteAndRelease:
 
         registered_in_active: bool = False
 
-        async def mock_execute_with_lease(rid: str, wn: str) -> None:
+        # The claimer registers itself in active_runs (_execute_with_lease, AE-1352).
+        async def mock_execute_with_lease(rid: str, wn: str) -> bool:
             nonlocal registered_in_active
+            active_runs[rid] = asyncio.current_task()  # type: ignore[assignment]
             registered_in_active = run_id in active_runs
+            return True
 
         executor._execute_with_lease = AsyncMock(side_effect=mock_execute_with_lease)  # type: ignore[method-assign]
 
@@ -722,6 +725,8 @@ class TestExecuteWithLease:
         execution that corrupts run state."""
         run_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         executor = WorkerExecutor()
+        # A started executor: a stopped one takes the shutdown requeue path instead.
+        executor._running = True
 
         job_task_was_cancelled = False
 

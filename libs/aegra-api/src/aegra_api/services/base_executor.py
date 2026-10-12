@@ -26,4 +26,6 @@ class BaseExecutor(ABC):
 
     @abstractmethod
     async def stop(self) -> None:
-        """Drain in-flight work and release resources (called during shutdown)."""
+        """Stop taking work and release resources (called during shutdown).
+
+        WorkerExecutor hands in-flight runs back to the queue; LocalExecutor cancels them."""

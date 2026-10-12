@@ -26,11 +26,12 @@ def _lane_column():  # noqa: ANN202 — SQLAlchemy expression
 
 
 async def pending_by_lane(session: AsyncSession) -> dict[str, dict[str, float | int | None]]:
-    """Per lane: unclaimed pending runs and the age in seconds of the oldest one."""
+    """Per lane: unclaimed pending runs and how long the oldest has been pending
+    (updated_at: set when a requeue or the reaper puts a run back to pending)."""
     # GROUP BY sull'alias: ripetere l'espressione JSON la rilega con parametri nuovi
     # ($4, $5) e Postgres non la riconosce come la stessa colonna del SELECT.
     rows = await session.execute(
-        select(_lane_column().label("lane"), func.count(), func.min(RunORM.created_at))
+        select(_lane_column().label("lane"), func.count(), func.min(RunORM.updated_at))
         .where(RunORM.status == "pending", RunORM.claimed_by.is_(None))
         .group_by(text("lane"))
     )

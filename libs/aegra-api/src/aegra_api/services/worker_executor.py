@@ -43,6 +43,9 @@ logger = structlog.getLogger(__name__)
 
 # Terminal run states (kept local to avoid circular import with run_waiters -> executor)
 _TERMINAL_STATUSES = frozenset({"success", "error", "interrupted"})
+# On shutdown a cancelled graph gets this long to unwind before its run is requeued:
+# a slow handler (usage report POSTs) must not push the requeue past the SIGKILL.
+_SHUTDOWN_UNWIND_SECONDS = 1.0
 _RUN_ID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
@@ -62,6 +65,7 @@ class WorkerExecutor(BaseExecutor):
         self._graph_tasks: set[asyncio.Task[None]] = set()
         # Runs handed back to the queue by stop(): they keep their bg demand entry.
         self._requeued_on_stop: set[str] = set()
+        self._job_run_ids: dict[asyncio.Task[None], str] = {}
         # hostname-pid is not unique on Cloud Run (`localhost-1` on every
         # instance): workers of different instances would share names and the
         # lease check (claimed_by == worker name) could not tell which one
@@ -171,7 +175,12 @@ class WorkerExecutor(BaseExecutor):
                 task.cancel()
             _, pending = await asyncio.wait(self._job_tasks, timeout=settings.worker.WORKER_DRAIN_TIMEOUT)
             if pending:
-                logger.error("In-flight jobs not requeued before the drain timeout", count=len(pending))
+                logger.error(
+                    "In-flight jobs not requeued before the drain timeout",
+                    count=len(pending),
+                    run_ids=sorted(self._job_run_ids[t] for t in pending if t in self._job_run_ids),
+                    drain_timeout_s=settings.worker.WORKER_DRAIN_TIMEOUT,
+                )
 
         self._worker_tasks.clear()
         self._job_tasks.clear()
@@ -218,7 +227,9 @@ class WorkerExecutor(BaseExecutor):
 
                 task = asyncio.create_task(self._execute_and_release(run_id, worker_name, semaphore))
                 self._job_tasks.add(task)
+                self._job_run_ids[task] = run_id
                 task.add_done_callback(self._job_tasks.discard)
+                task.add_done_callback(self._forget_job)
 
             except asyncio.CancelledError:
                 break
@@ -229,6 +240,9 @@ class WorkerExecutor(BaseExecutor):
 
         logger.info("Worker stopped", worker=worker_name)
 
+    def _forget_job(self, task: asyncio.Task[None]) -> None:
+        self._job_run_ids.pop(task, None)
+
     async def _execute_and_release(
         self,
         run_id: str,
@@ -236,13 +250,12 @@ class WorkerExecutor(BaseExecutor):
         semaphore: asyncio.Semaphore,
     ) -> None:
         """Execute a run with lease + timeout, then release the semaphore slot."""
-        # Register in active_runs so cancel-on-disconnect and explicit
-        # cancel can find and cancel this specific job task.
         current_task = asyncio.current_task()
-        if current_task is not None:
-            active_runs[run_id] = current_task
+        # False only when the claim was lost to another entry; a timeout or a cancel
+        # leaves it True, and the run gives back its demand entry as before.
+        claimed = True
         try:
-            await asyncio.wait_for(
+            claimed = await asyncio.wait_for(
                 self._execute_with_lease(run_id, worker_name),
                 timeout=settings.worker.BG_JOB_TIMEOUT_SECS,
             )
@@ -278,9 +291,11 @@ class WorkerExecutor(BaseExecutor):
             # task under the same key, and must stay cancellable.
             if active_runs.get(run_id) is current_task:
                 active_runs.pop(run_id, None)
+            # A duplicate queue entry that lost the claim does not own the demand
+            # entry: releasing it would hide a run in flight from the autoscaler.
             if run_id in self._requeued_on_stop:
                 self._requeued_on_stop.discard(run_id)
-            elif "bg" in consumed_lanes():
+            elif claimed and "bg" in consumed_lanes():
                 await _release_demand(run_id)
             semaphore.release()
 
@@ -306,7 +321,7 @@ class WorkerExecutor(BaseExecutor):
             await asyncio.sleep(settings.worker.POSTGRES_POLL_INTERVAL_SECONDS)
             return await self._poll_postgres()
 
-    async def _execute_with_lease(self, run_id: str, worker_name: str) -> None:
+    async def _execute_with_lease(self, run_id: str, worker_name: str) -> bool:
         """Acquire lease, load job from DB, execute with heartbeat.
 
         The lease is held under a token unique to THIS claim, not the worker
@@ -320,12 +335,20 @@ class WorkerExecutor(BaseExecutor):
         try:
             loaded = await _acquire_and_load(run_id, claim)
         except asyncio.CancelledError:
-            if not self._running and await _requeue_claim(run_id, claim):
+            # Already out of the queue: requeue the claim, or push the run back
+            # if the claim never committed, or it would wait for the reaper.
+            if not self._running and (await _requeue_claim(run_id, claim) or await _push_back_unclaimed(run_id)):
                 self._requeued_on_stop.add(run_id)
             raise
         if loaded is None:
             logger.debug("Lease not acquired or job missing, skipping", run_id=run_id, worker=worker_name)
-            return
+            return False
+
+        # Only the claimer: a duplicate queue entry must not take the cancel
+        # handle of the task that runs it.
+        current = asyncio.current_task()
+        if current is not None:
+            active_runs[run_id] = current
 
         _restore_trace_context(run_id, loaded.job, loaded.trace)
         logger.info(
@@ -360,18 +383,20 @@ class WorkerExecutor(BaseExecutor):
         except Exception:
             logger.exception("Worker job failed", worker=worker_name, run_id=run_id)
         finally:
-            # Cancel both child tasks — job_task may still be running if
-            # this coroutine was cancelled by wait_for timeout (CancelledError
-            # is delivered to `await job_task`, but the Task itself is not
-            # cancelled automatically).
+            # A cancel of this coroutine reaches job_task through the await, but
+            # job_task may still be unwinding: cancel both and wait for them.
             if not job_task.done():
                 job_task.cancel()
             heartbeat_task.cancel()
+            if not self._running:
+                await asyncio.wait({job_task}, timeout=_SHUTDOWN_UNWIND_SECONDS)
+            shutdown_cancel = not self._running and (job_task.cancelled() or not job_task.done())
+            requeued = shutdown_cancel and await _requeue_claim(run_id, claim)
+            if requeued:
+                self._requeued_on_stop.add(run_id)
             with contextlib.suppress(asyncio.CancelledError):
                 await asyncio.gather(job_task, heartbeat_task, return_exceptions=True)
-            if not self._running and job_task.cancelled() and await _requeue_claim(run_id, claim):
-                self._requeued_on_stop.add(run_id)
-            else:
+            if not requeued:
                 await _release_lease(run_id, claim)
 
             elapsed = (datetime.now(UTC) - lease_acquired_at).total_seconds()
@@ -381,6 +406,7 @@ class WorkerExecutor(BaseExecutor):
                 run_id=run_id,
                 execution_seconds=round(elapsed, 2),
             )
+        return True
 
     @staticmethod
     async def _poll_postgres() -> str | None:
@@ -508,19 +534,48 @@ async def _requeue_claim(run_id: str, claim: str) -> bool:
         params = await session.scalar(
             update(RunORM)
             .where(RunORM.run_id == run_id, RunORM.claimed_by == claim, RunORM.status == "running")
-            .values(status="pending", claimed_by=None, lease_expires_at=None)
+            # updated_at marks when the run became pending again: the reaper and the
+            # lane alarm count from here, not from its creation hours ago.
+            .values(status="pending", claimed_by=None, lease_expires_at=None, updated_at=datetime.now(UTC))
             .returning(RunORM.execution_params)
         )
         await session.commit()
     if params is None:
         return False
-    lane = lane_of(params.get("run_metadata"))
+    await _push_to_lane(run_id, lane_of(params.get("run_metadata")))
+    return True
+
+
+async def _push_back_unclaimed(run_id: str) -> bool:
+    """A run popped from the queue whose claim never committed: still pending and
+    unclaimed, but in no queue (AE-1352)."""
+    maker = _get_session_maker()
+    async with maker() as session:
+        params = await session.scalar(
+            select(RunORM.execution_params).where(
+                RunORM.run_id == run_id, RunORM.status == "pending", RunORM.claimed_by.is_(None)
+            )
+        )
+    if params is None:
+        return False
+    await _push_to_lane(run_id, lane_of(params.get("run_metadata")))
+    return True
+
+
+async def _push_to_lane(run_id: str, lane: str) -> None:
+    # RuntimeError: a closed uvloop transport (core/redis_manager.py) must not
+    # replace the shutdown CancelledError on its way up.
     try:
         await redis_manager.get_client().rpush(queue_key(lane), run_id)  # type: ignore[arg-type]
-    except RedisError as exc:
-        logger.warning("Requeue push failed, the reaper re-enqueues the pending run", run_id=run_id, error=str(exc))
+    except (RedisError, RuntimeError) as exc:
+        logger.warning(
+            "Requeue push failed, the reaper re-enqueues the run once pending past the stuck threshold",
+            run_id=run_id,
+            error=repr(exc),
+            stuck_threshold_s=settings.worker.STUCK_PENDING_THRESHOLD_SECONDS,
+        )
+        return
     logger.info("Requeued in-flight run on shutdown", run_id=run_id, lane=lane)
-    return True
 
 
 async def _heartbeat_loop(

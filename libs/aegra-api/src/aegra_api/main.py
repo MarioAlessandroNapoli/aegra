@@ -145,7 +145,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
     yield
 
-    # Shutdown order: cron → reaper → executor (drains jobs) → broker → Redis → DB
+    # Shutdown order: cron → reaper → executor (requeues or cancels jobs) → broker → Redis → DB
     if settings.cron.CRON_ENABLED:
         await cron_scheduler.stop()
     if settings.redis.REDIS_BROKER_ENABLED:
