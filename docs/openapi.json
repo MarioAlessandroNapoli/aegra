@@ -3,7 +3,7 @@
   "info": {
     "title": "Aegra",
     "description": "Production-ready Agent Protocol server",
-    "version": "0.9.24"
+    "version": "0.9.24+crrm.8"
   },
   "paths": {
     "/info": {
@@ -115,6 +115,28 @@
                   },
                   "type": "object",
                   "title": "Response Liveness Check Live Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/queues": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "summary": "Queues",
+        "description": "Lane health for monitoring (athena-backend system-health). A stalled lane means\nno worker consumes it: for bg, the worker pool or its autoscaler is down.",
+        "operationId": "queues_queues_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueuesResponse"
                 }
               }
             }
@@ -1509,6 +1531,59 @@
                     "$ref": "#/components/schemas/ThreadState"
                   },
                   "title": "Response Get Thread History Get Threads  Thread Id  History Get"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentProtocolError"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/threads/{thread_id}/copy": {
+      "post": {
+        "tags": [
+          "Threads"
+        ],
+        "summary": "Copy Thread",
+        "description": "Deep-copy a thread, preserving its ``checkpoint_id`` chain.\n\nMetadata is inherited from the source; ``created_at``/``updated_at`` are\nregenerated and active ``status`` (``busy``/``running``) resets to\n``idle`` since the copy has no run to advance it.",
+        "operationId": "copy_thread_threads__thread_id__copy_post",
+        "parameters": [
+          {
+            "name": "thread_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Thread Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Thread"
                 }
               }
             }
@@ -4511,6 +4586,50 @@
         ],
         "title": "InfoResponse",
         "description": "Info endpoint response model"
+      },
+      "QueuesResponse": {
+        "properties": {
+          "lanes": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Lanes",
+            "description": "Per lane: pending (unclaimed) and oldest_pending_s."
+          },
+          "bg_demand": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bg Demand",
+            "description": "Length of the bg demand list the bg pool scales on."
+          },
+          "stalled": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Stalled",
+            "description": "Lanes whose oldest pending run is older than alarm_s."
+          },
+          "alarm_s": {
+            "type": "integer",
+            "title": "Alarm S",
+            "description": "LANE_STALL_ALARM_SECONDS."
+          }
+        },
+        "type": "object",
+        "required": [
+          "lanes",
+          "bg_demand",
+          "stalled",
+          "alarm_s"
+        ],
+        "title": "QueuesResponse",
+        "description": "Job lanes: unclaimed pending runs, the oldest one's age, and the stall alarm."
       },
       "Run": {
         "properties": {
