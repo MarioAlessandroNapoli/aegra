@@ -59,8 +59,11 @@ UpperStr = Annotated[str, BeforeValidator(parse_upper)]
 class EnvBase(BaseSettings):
     """Base settings model that ignores unknown environment variables."""
 
+    # Settings carry secrets and a startup ValidationError lands in container logs:
+    # keep the field name and error type, never the rejected value.
     model_config = SettingsConfigDict(
         extra="ignore",
+        hide_input_in_errors=True,
     )
 
 
