@@ -379,12 +379,31 @@ class WorkerSettings(EnvBase):
     # (bg worker pool down, autoscaler stopped): the reaper logs it at ERROR and /queues
     # reports it, so a stalled lane is loud instead of silent.
     LANE_STALL_ALARM_SECONDS: int = 600
+    # Serving gate (services/serving_gate.py): set on a Cloud Run service, the workers dequeue only
+    # while this revision holds traffic. Empty = off (dev, worker pools).
+    SERVING_GATE_SERVICE: str = ""
+    SERVING_GATE_REGION: str = ""
+    SERVING_GATE_PROJECT: str = ""
+    SERVING_GATE_INTERVAL_SECONDS: float = 5.0
 
     @model_validator(mode="after")
     def _validate_lanes(self) -> "WorkerSettings":
         unknown = set(self.WORKER_LANES) - {"chat", "bg"}
         if not self.WORKER_LANES or unknown:
             raise ValueError(f"WORKER_LANES must be a non-empty subset of chat, bg; got {self.WORKER_LANES}")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_serving_gate(self) -> "WorkerSettings":
+        if not self.SERVING_GATE_SERVICE:
+            return self
+        if not self.SERVING_GATE_REGION or not self.SERVING_GATE_PROJECT:
+            raise ValueError("SERVING_GATE_SERVICE needs SERVING_GATE_REGION and SERVING_GATE_PROJECT")
+        # The bg lane runs on a worker pool, which has no traffic split to read.
+        if "bg" in self.WORKER_LANES:
+            raise ValueError(f"SERVING_GATE_SERVICE is for chat-only services; WORKER_LANES is {self.WORKER_LANES}")
+        if self.SERVING_GATE_INTERVAL_SECONDS <= 0:
+            raise ValueError("SERVING_GATE_INTERVAL_SECONDS must be > 0")
         return self
 
     @model_validator(mode="after")

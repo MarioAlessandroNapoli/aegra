@@ -37,6 +37,7 @@ from aegra_api.services.base_executor import BaseExecutor
 from aegra_api.services.lanes import LANE_KEY, consumed_lanes, demand_key, lane_of, queue_key
 from aegra_api.services.run_executor import _lease_loss_cancellations, execute_run
 from aegra_api.services.run_status import finalize_run, update_run_status
+from aegra_api.services.serving_gate import serving_gate
 from aegra_api.settings import settings
 
 logger = structlog.getLogger(__name__)
@@ -46,6 +47,8 @@ _TERMINAL_STATUSES = frozenset({"success", "error", "interrupted"})
 # On shutdown a cancelled graph gets this long to unwind before its run is requeued:
 # a slow handler (usage report POSTs) must not push the requeue past the SIGKILL.
 _SHUTDOWN_UNWIND_SECONDS = 1.0
+# A gated-off worker loop rechecks the serving gate this often.
+_GATE_IDLE_SECONDS = 1.0
 _RUN_ID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
@@ -130,6 +133,7 @@ class WorkerExecutor(BaseExecutor):
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
+        await serving_gate.start()
         self._running = True
         count = settings.worker.WORKER_COUNT
         if count == 0:
@@ -184,6 +188,7 @@ class WorkerExecutor(BaseExecutor):
 
         self._worker_tasks.clear()
         self._job_tasks.clear()
+        await serving_gate.stop()
         logger.info("Worker executor stopped", instance=self._instance_id)
 
     # ------------------------------------------------------------------
@@ -214,6 +219,11 @@ class WorkerExecutor(BaseExecutor):
                 if not self._running:
                     semaphore.release()
                     break
+
+                if not serving_gate.consuming:
+                    semaphore.release()
+                    await asyncio.sleep(_GATE_IDLE_SECONDS)
+                    continue
 
                 run_id = await self._dequeue()
                 if run_id is None:

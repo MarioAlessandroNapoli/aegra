@@ -50,6 +50,8 @@ dependencies = [
     # Utils
     "structlog>=25.4.0",
     "asgi-correlation-id>=4.3.4",
+    # Serving gate: Cloud Run Admin API and metadata server (AE-1689)
+    "httpx>=0.28.1",
 
     # Redis (optional broker backend for multi-instance streaming)
     "redis[hiredis]>=5.0.0",
