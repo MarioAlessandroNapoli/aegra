@@ -35,6 +35,10 @@ class ServingGate:
         self._url = ""
 
     @property
+    def revision(self) -> str:
+        return self._revision
+
+    @property
     def enabled(self) -> bool:
         return bool(settings.worker.SERVING_GATE_SERVICE)
 

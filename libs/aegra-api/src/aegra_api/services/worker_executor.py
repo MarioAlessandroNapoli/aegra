@@ -321,7 +321,19 @@ class WorkerExecutor(BaseExecutor):
             result = await client.blpop(keys, timeout=5)  # type: ignore[arg-type]
             if result is None:
                 return None
-            return result[1]
+            queue, run_id = result
+            # The gate may close while BLPOP waits: the run goes back to the head of its
+            # queue before any claim, for the serving revision to take (AE-1689).
+            if not serving_gate.consuming:
+                await client.lpush(queue, run_id)  # type: ignore[misc]
+                logger.info(
+                    "Run pushed back, revision not serving",
+                    run_id=run_id,
+                    queue=queue,
+                    revision=serving_gate.revision,
+                )
+                return None
+            return run_id
         except RedisTimeoutError:
             # Idle expiry: a blocking BLPOP hit the socket timeout with no jobs.
             # Normal when the queue is empty, not a connectivity failure — re-loop.
@@ -329,6 +341,9 @@ class WorkerExecutor(BaseExecutor):
         except RedisError as exc:
             logger.warning("Redis BLPOP failed, falling back to Postgres poll", error=str(exc))
             await asyncio.sleep(settings.worker.POSTGRES_POLL_INTERVAL_SECONDS)
+            # The poll only selects, nothing to hand back: a closed gate just skips it.
+            if not serving_gate.consuming:
+                return None
             return await self._poll_postgres()
 
     async def _execute_with_lease(self, run_id: str, worker_name: str) -> bool:
